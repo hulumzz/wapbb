@@ -7,6 +7,7 @@ import { createSqlAuthState, hasStoredAuthState } from './sql-auth-state.js'
 import type { MessagingProvider, MessagingState, SendTextInput, SendResult } from './types.js'
 
 const ACCOUNT_ID = 'default'
+const RECONNECT_DELAY_MS = 3_000
 
 export class BaileysProvider implements MessagingProvider {
   private socket: WASocket | null = null
@@ -16,6 +17,8 @@ export class BaileysProvider implements MessagingProvider {
     qrDataUrl: null,
   }
   private connecting: Promise<void> | null = null
+  private reconnectTimer: NodeJS.Timeout | null = null
+  private manualDisconnect = false
 
   async restore(): Promise<void> {
     await this.ensureAccount()
@@ -25,6 +28,12 @@ export class BaileysProvider implements MessagingProvider {
   async connect(): Promise<void> {
     if (this.state.status === 'CONNECTED' || this.state.status === 'CONNECTING') return
     if (this.connecting) return this.connecting
+
+    this.manualDisconnect = false
+    if (this.reconnectTimer) {
+      clearTimeout(this.reconnectTimer)
+      this.reconnectTimer = null
+    }
 
     this.connecting = this.openSocket().finally(() => {
       this.connecting = null
@@ -40,7 +49,6 @@ export class BaileysProvider implements MessagingProvider {
     const { state, saveCreds } = await createSqlAuthState(ACCOUNT_ID)
     const socket = makeWASocket({
       auth: state,
-      printQRInTerminal: false,
       markOnlineOnConnect: false,
       syncFullHistory: false,
     })
@@ -76,11 +84,26 @@ export class BaileysProvider implements MessagingProvider {
           qrDataUrl: null,
         }
         await this.persistStatus(this.state.status)
+
+        if (!loggedOut && !this.manualDisconnect) this.scheduleReconnect()
       }
     })
   }
 
+  private scheduleReconnect() {
+    if (this.reconnectTimer) return
+    this.reconnectTimer = setTimeout(() => {
+      this.reconnectTimer = null
+      void this.connect().catch(() => undefined)
+    }, RECONNECT_DELAY_MS)
+  }
+
   async disconnect(): Promise<void> {
+    this.manualDisconnect = true
+    if (this.reconnectTimer) {
+      clearTimeout(this.reconnectTimer)
+      this.reconnectTimer = null
+    }
     this.socket?.end(undefined)
     this.socket = null
     this.state = { ...this.state, status: 'DISCONNECTED', qrDataUrl: null }
