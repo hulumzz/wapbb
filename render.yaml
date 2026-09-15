@@ -1,0 +1,35 @@
+services:
+  - type: web
+    name: wapbb-api
+    runtime: node
+    plan: free
+    region: singapore
+    rootDir: apps/api
+    buildCommand: npm install && npm run build
+    startCommand: npm start
+    healthCheckPath: /health
+    autoDeployTrigger: commit
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: DATABASE_URL
+        sync: false
+      - key: WEB_ORIGIN
+        sync: false
+      - key: INTERNAL_DISPATCH_SECRET
+        generateValue: true
+      - key: WA_SESSION_ENCRYPTION_KEY
+        generateValue: true
+      - key: DEFAULT_BATCH_SIZE
+        value: "10"
+
+  - type: web
+    name: wapbb-web
+    runtime: static
+    rootDir: apps/web
+    buildCommand: npm install && npm run build
+    staticPublishPath: ./dist
+    autoDeployTrigger: commit
+    envVars:
+      - key: VITE_API_URL
+        sync: false
