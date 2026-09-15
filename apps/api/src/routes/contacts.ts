@@ -39,7 +39,7 @@ export async function registerContactRoutes(app: FastifyInstance) {
   app.patch('/api/contacts/:id', async (request) => {
     const params = z.object({ id: z.string().uuid() }).parse(request.params)
     const input = contactInput.partial().extend({ isActive: z.boolean().optional() }).parse(request.body)
-    const update: Record<string, unknown> = { ...input, updatedAt: new Date() }
+    const update: Partial<typeof contacts.$inferInsert> = { ...input, updatedAt: new Date() }
     if (input.phone) update.phoneNormalized = normalizeIndonesianPhone(input.phone)
 
     const [updated] = await db.update(contacts).set(update).where(eq(contacts.id, params.id)).returning()
