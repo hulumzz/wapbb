@@ -1,8 +1,10 @@
 import Fastify from 'fastify'
 import cors from '@fastify/cors'
+import jwt from '@fastify/jwt'
 import { ZodError } from 'zod'
 import { config } from './config.js'
 import { BaileysProvider } from './providers/whatsapp/baileys.provider.js'
+import { registerAuthRoutes } from './routes/auth.js'
 import { registerCampaignRoutes } from './routes/campaigns.js'
 import { registerContactRoutes } from './routes/contacts.js'
 import { registerDashboardRoutes } from './routes/dashboard.js'
@@ -19,9 +21,26 @@ export async function buildApp() {
     origin: config.WEB_ORIGIN.split(',').map((item) => item.trim()),
     credentials: true,
   })
+  await app.register(jwt, { secret: config.AUTH_SECRET })
 
   app.get('/health', async () => ({ ok: true, service: 'wapbb-api' }))
 
+  app.addHook('onRequest', async (request, reply) => {
+    const url = request.raw.url ?? ''
+    if (request.method === 'OPTIONS' || url === '/health' || url.startsWith('/auth/') || url.startsWith('/internal/')) {
+      return
+    }
+
+    if (url.startsWith('/api/')) {
+      try {
+        await request.jwtVerify()
+      } catch {
+        return reply.code(401).send({ message: 'Sesi admin tidak valid atau sudah berakhir' })
+      }
+    }
+  })
+
+  await registerAuthRoutes(app)
   await registerContactRoutes(app)
   await registerTemplateRoutes(app)
   await registerCampaignRoutes(app)
