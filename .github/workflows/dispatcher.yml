@@ -1,0 +1,25 @@
+name: Dispatch message queue
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '*/10 * * * *'
+
+jobs:
+  dispatch:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Trigger dispatcher
+        env:
+          DISPATCH_URL: ${{ secrets.DISPATCH_URL }}
+          DISPATCH_SECRET: ${{ secrets.DISPATCH_SECRET }}
+        run: |
+          if [ -z "$DISPATCH_URL" ] || [ -z "$DISPATCH_SECRET" ]; then
+            echo "DISPATCH_URL / DISPATCH_SECRET belum diset; skip."
+            exit 0
+          fi
+
+          curl --fail-with-body --silent --show-error \
+            -X POST "$DISPATCH_URL" \
+            -H "Authorization: Bearer $DISPATCH_SECRET" \
+            -H "Content-Type: application/json"
