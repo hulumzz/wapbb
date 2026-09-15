@@ -15,13 +15,15 @@ export function clearAuthToken() {
 
 export async function api<T = any>(path: string, options: RequestInit = {}): Promise<T> {
   const token = getAuthToken()
+  const headers = new Headers(options.headers)
+  if (token) headers.set('Authorization', `Bearer ${token}`)
+  if (options.body !== undefined && !headers.has('Content-Type')) {
+    headers.set('Content-Type', 'application/json')
+  }
+
   const response = await fetch(`${API_URL}${path}`, {
     ...options,
-    headers: {
-      'Content-Type': 'application/json',
-      ...(token ? { Authorization: `Bearer ${token}` } : {}),
-      ...options.headers,
-    },
+    headers,
   })
 
   if (!response.ok) {

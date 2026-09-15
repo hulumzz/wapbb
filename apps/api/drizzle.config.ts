@@ -6,15 +6,13 @@ import { defineConfig } from 'drizzle-kit'
 const here = dirname(fileURLToPath(import.meta.url))
 loadEnv({ path: resolve(here, '../../.env') })
 
-if (!process.env.DATABASE_URL) {
-  throw new Error('DATABASE_URL wajib diisi sebelum menjalankan perintah database')
-}
-
 export default defineConfig({
   schema: './src/db/schema.ts',
   out: './drizzle',
   dialect: 'postgresql',
   dbCredentials: {
-    url: process.env.DATABASE_URL,
+    // `generate` dan `check` hanya membaca schema dan harus tetap bisa
+    // dijalankan sebelum Neon tersedia. Runtime migrator memvalidasi URL asli.
+    url: process.env.DATABASE_URL ?? 'postgresql://placeholder:placeholder@localhost/placeholder',
   },
 })

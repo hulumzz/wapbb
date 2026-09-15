@@ -4,13 +4,16 @@
   "private": true,
   "workspaces": ["apps/*"],
   "engines": {
-    "node": ">=20"
+    "node": ">=20.19.0"
   },
   "scripts": {
     "dev:api": "npm run dev -w @wapbb/api",
     "dev:web": "npm run dev -w @wapbb/web",
     "build": "npm run build -w @wapbb/api && npm run build -w @wapbb/web",
     "typecheck": "npm run typecheck -w @wapbb/api && npm run typecheck -w @wapbb/web",
-    "db:push": "npm run db:push -w @wapbb/api"
+    "test": "npm run test -w @wapbb/api && npm run test -w @wapbb/web",
+    "db:generate": "npm run db:generate -w @wapbb/api",
+    "db:check": "npm run db:check -w @wapbb/api",
+    "db:migrate": "npm run db:migrate -w @wapbb/api"
   }
 }

@@ -4,9 +4,8 @@ services:
     runtime: node
     plan: free
     region: singapore
-    rootDir: apps/api
-    buildCommand: npm install && npm run build
-    startCommand: npm start
+    buildCommand: npm ci --include=dev && npm run build -w @wapbb/api
+    startCommand: npm run db:migrate:compiled -w @wapbb/api && npm run start -w @wapbb/api
     healthCheckPath: /health
     autoDeployTrigger: commit
     envVars:
@@ -32,9 +31,8 @@ services:
   - type: web
     name: wapbb-web
     runtime: static
-    rootDir: apps/web
-    buildCommand: npm install && npm run build
-    staticPublishPath: ./dist
+    buildCommand: npm ci --include=dev && npm run build -w @wapbb/web
+    staticPublishPath: ./apps/web/dist
     autoDeployTrigger: commit
     envVars:
       - key: VITE_API_URL

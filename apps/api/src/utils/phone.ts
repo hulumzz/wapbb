@@ -1,3 +1,7 @@
+export class PhoneValidationError extends Error {
+  readonly statusCode = 400
+}
+
 export function normalizeIndonesianPhone(input: string): string {
   let phone = input.trim().replace(/[\s\-().]/g, '')
 
@@ -6,7 +10,7 @@ export function normalizeIndonesianPhone(input: string): string {
   else if (phone.startsWith('8')) phone = `62${phone}`
 
   if (!/^62\d{8,13}$/.test(phone)) {
-    throw new Error('Nomor WhatsApp tidak valid. Gunakan nomor Indonesia yang aktif.')
+    throw new PhoneValidationError('Nomor WhatsApp tidak valid. Gunakan nomor Indonesia yang aktif.')
   }
 
   return phone

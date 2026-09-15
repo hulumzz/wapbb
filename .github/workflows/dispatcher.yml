@@ -21,5 +21,4 @@ jobs:
 
           curl --fail-with-body --silent --show-error \
             -X POST "$DISPATCH_URL" \
-            -H "Authorization: Bearer $DISPATCH_SECRET" \
-            -H "Content-Type: application/json"
+            -H "Authorization: Bearer $DISPATCH_SECRET"

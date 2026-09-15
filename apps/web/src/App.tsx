@@ -1,13 +1,15 @@
 import { FormEvent, useEffect, useMemo, useState } from 'react'
 import { api } from './api'
+import { ContactImportPanel } from './ContactImportPanel'
 
 type Page = 'dashboard' | 'contacts' | 'campaigns' | 'templates' | 'history' | 'whatsapp'
-type Contact = { id: string; fullName: string; phone: string; phoneNormalized: string; isActive: boolean }
+type Contact = { id: string; fullName: string; phone: string; phoneNormalized: string; isActive: boolean; whatsappOptIn: boolean }
 type Template = { id: string; name: string; content: string; isActive: boolean }
-type Campaign = { id: string; name: string; status: string; batchSize: number; createdAt: string }
-type Message = { id: string; recipient: string; renderedMessage: string; status: string; createdAt: string; errorMessage?: string | null }
+type Campaign = { id: string; name: string; status: string; batchSize: number; createdAt: string; recipientCount: number; queuedCount: number; sentCount: number; failedCount: number }
+type Message = { id: string; recipient: string; renderedMessage: string; status: string; attempts: number; maxAttempts: number; createdAt: string; errorCode?: string | null; errorMessage?: string | null }
 type WhatsappState = { status: string; phoneNumber: string | null; qrDataUrl: string | null }
 type Dashboard = { contacts: number; activeCampaigns: number; queued: number; sent: number; failed: number; whatsapp: WhatsappState }
+type CampaignPreview = { recipientCount: number; samples: Array<{ contactId: string; fullName: string; recipient: string; renderedMessage: string }> }
 
 const nav: Array<{ id: Page; label: string; icon: string }> = [
   { id: 'dashboard', label: 'Dashboard', icon: '⌂' },
@@ -21,6 +23,12 @@ const nav: Array<{ id: Page; label: string; icon: string }> = [
 export default function App() {
   const [page, setPage] = useState<Page>('dashboard')
   const [notice, setNotice] = useState<string | null>(null)
+
+  useEffect(() => {
+    if (!notice) return
+    const timer = window.setTimeout(() => setNotice(null), 4500)
+    return () => window.clearTimeout(timer)
+  }, [notice])
 
   return (
     <div className="app-shell">
@@ -44,13 +52,13 @@ export default function App() {
           <div><p className="eyebrow">WA PBB REMINDER</p><h1>{nav.find((n) => n.id === page)?.label}</h1></div>
           <div className="admin-pill"><span>AD</span><div><strong>Administrator</strong><small>Desa</small></div></div>
         </header>
-        {notice && <div className="notice" onClick={() => setNotice(null)}>{notice}</div>}
+        {notice && <div className="notice" role="status"><span>{notice}</span><button aria-label="Tutup notifikasi" onClick={() => setNotice(null)}>×</button></div>}
         <section className="content">
           {page === 'dashboard' && <DashboardPage />}
           {page === 'contacts' && <ContactsPage notify={setNotice} />}
           {page === 'campaigns' && <CampaignsPage notify={setNotice} />}
           {page === 'templates' && <TemplatesPage notify={setNotice} />}
-          {page === 'history' && <HistoryPage />}
+          {page === 'history' && <HistoryPage notify={setNotice} />}
           {page === 'whatsapp' && <WhatsappPage notify={setNotice} />}
         </section>
       </main>
@@ -61,14 +69,32 @@ export default function App() {
 function DashboardPage() {
   const [data, setData] = useState<Dashboard | null>(null)
   const [error, setError] = useState('')
-  useEffect(() => { api<Dashboard>('/api/dashboard').then(setData).catch((e) => setError(e.message)) }, [])
+  const [refreshing, setRefreshing] = useState(false)
+  const [updatedAt, setUpdatedAt] = useState<Date | null>(null)
+  async function load(silent = false) {
+    if (!silent) setRefreshing(true)
+    try {
+      setData(await api<Dashboard>('/api/dashboard'))
+      setUpdatedAt(new Date())
+      setError('')
+    } catch (caught) {
+      if (!silent) setError(caught instanceof Error ? caught.message : 'Dashboard tidak dapat dimuat')
+    } finally {
+      setRefreshing(false)
+    }
+  }
+  useEffect(() => {
+    load()
+    const timer = window.setInterval(() => load(true), 10000)
+    return () => window.clearInterval(timer)
+  }, [])
   if (error) return <EmptyState title="API belum tersambung" text={error} />
   if (!data) return <Loading />
 
   return <>
     <div className="status-banner">
       <div><span className={`status-led ${data.whatsapp.status === 'CONNECTED' ? 'online' : ''}`} /><strong>WhatsApp {data.whatsapp.status}</strong><p>{data.whatsapp.phoneNumber ?? 'Belum ada nomor yang terhubung'}</p></div>
-      <span className="muted">Queue tersimpan di PostgreSQL</span>
+      <div className="status-actions"><span className="muted">Diperbarui {updatedAt?.toLocaleTimeString('id-ID', { hour: '2-digit', minute: '2-digit', second: '2-digit' })}</span><button onClick={() => load()} disabled={refreshing}>{refreshing ? 'Memuat…' : '↻ Segarkan'}</button></div>
     </div>
     <div className="metric-grid">
       <Metric label="Kontak aktif" value={data.contacts} helper="Siap dipilih" />
@@ -86,57 +112,223 @@ function ContactsPage({ notify }: { notify: (v: string) => void }) {
   const [name, setName] = useState('')
   const [phone, setPhone] = useState('')
   const [search, setSearch] = useState('')
-  const load = () => api<Contact[]>(`/api/contacts${search ? `?search=${encodeURIComponent(search)}` : ''}`).then(setItems)
-  useEffect(() => { load().catch(() => undefined) }, [search])
+  const [editingId, setEditingId] = useState<string | null>(null)
+  const [whatsappOptIn, setWhatsappOptIn] = useState(true)
+  const [showImport, setShowImport] = useState(false)
+  const [loading, setLoading] = useState(true)
+  const [busy, setBusy] = useState('')
+  async function load() {
+    setLoading(true)
+    try {
+      setItems(await api<Contact[]>(`/api/contacts${search ? `?search=${encodeURIComponent(search)}` : ''}`))
+    } catch (caught) {
+      notify(caught instanceof Error ? caught.message : 'Kontak tidak dapat dimuat')
+    } finally {
+      setLoading(false)
+    }
+  }
+  useEffect(() => { load() }, [search])
 
   async function submit(e: FormEvent) {
     e.preventDefault()
+    if (busy) return
+    setBusy('save')
     try {
-      await api('/api/contacts', { method: 'POST', body: JSON.stringify({ fullName: name, phone, whatsappOptIn: true }) })
-      setName(''); setPhone(''); await load(); notify('Kontak berhasil ditambahkan')
+      await api(editingId ? `/api/contacts/${editingId}` : '/api/contacts', {
+        method: editingId ? 'PATCH' : 'POST',
+        body: JSON.stringify({ fullName: name, phone, whatsappOptIn }),
+      })
+      const message = editingId ? 'Kontak berhasil diperbarui' : 'Kontak berhasil ditambahkan'
+      setName(''); setPhone(''); setWhatsappOptIn(true); setEditingId(null); await load(); notify(message)
     } catch (e) { notify(e instanceof Error ? e.message : 'Gagal menambah kontak') }
+    finally { setBusy('') }
   }
 
-  return <div className="split-layout">
+  function edit(item: Contact) {
+    setEditingId(item.id)
+    setName(item.fullName)
+    setPhone(item.phone)
+    setWhatsappOptIn(item.whatsappOptIn)
+  }
+
+  async function deactivate(id: string) {
+    if (!window.confirm('Nonaktifkan kontak ini? Kontak tidak akan dipilih untuk campaign baru.')) return
+    setBusy(id)
+    try {
+      await api(`/api/contacts/${id}`, { method: 'DELETE' })
+      await load()
+      notify('Kontak dinonaktifkan')
+    } catch (e) { notify(e instanceof Error ? e.message : 'Gagal menonaktifkan kontak') }
+    finally { setBusy('') }
+  }
+
+  async function activate(id: string) {
+    setBusy(id)
+    try {
+      await api(`/api/contacts/${id}`, { method: 'PATCH', body: JSON.stringify({ isActive: true }) })
+      await load()
+      notify('Kontak diaktifkan kembali')
+    } catch (e) { notify(e instanceof Error ? e.message : 'Gagal mengaktifkan kontak') }
+    finally { setBusy('') }
+  }
+
+  return <>
+    <div className="page-toolbar"><div><p className="eyebrow">PENERIMA PESAN</p><p>Kelola manual atau impor daftar kontak sekaligus.</p></div><button className={showImport ? 'active' : ''} onClick={() => setShowImport((value) => !value)}>{showImport ? 'Tutup impor' : '↑ Impor Excel / CSV'}</button></div>
+    {showImport && <div className="panel import-shell"><ContactImportPanel onImported={load} notify={notify} /></div>}
+    <div className="split-layout">
     <div className="panel grow">
       <div className="panel-head"><div><h2>Daftar kontak</h2><p>{items.length} kontak ditampilkan</p></div><input className="search" placeholder="Cari nama atau nomor…" value={search} onChange={(e) => setSearch(e.target.value)} /></div>
-      <div className="table-wrap"><table><thead><tr><th>Nama lengkap</th><th>Nomor WhatsApp</th><th>Normalized</th><th>Status</th></tr></thead><tbody>
-        {items.map((item) => <tr key={item.id}><td><strong>{item.fullName}</strong></td><td>{item.phone}</td><td className="mono">{item.phoneNormalized}</td><td><span className={item.isActive ? 'badge success' : 'badge'}>{item.isActive ? 'Aktif' : 'Nonaktif'}</span></td></tr>)}
-        {!items.length && <tr><td colSpan={4}><div className="table-empty">Belum ada kontak. Tambahkan kontak pertama dari form di samping.</div></td></tr>}
+      <div className="table-wrap"><table><thead><tr><th>Nama lengkap</th><th>Nomor WhatsApp</th><th>Normalized</th><th>Status</th><th>Aksi</th></tr></thead><tbody>
+        {items.map((item) => <tr key={item.id}><td><strong>{item.fullName}</strong></td><td>{item.phone}</td><td className="mono">{item.phoneNormalized}</td><td><span className={item.isActive && item.whatsappOptIn ? 'badge success' : 'badge'}>{!item.isActive ? 'Nonaktif' : item.whatsappOptIn ? 'Opt-in' : 'Opt-out'}</span></td><td><div className="row-actions"><button disabled={!!busy} onClick={() => edit(item)}>Edit</button>{item.isActive ? <button disabled={!!busy} onClick={() => deactivate(item.id)}>{busy === item.id ? 'Memproses…' : 'Nonaktifkan'}</button> : <button disabled={!!busy} onClick={() => activate(item.id)}>{busy === item.id ? 'Memproses…' : 'Aktifkan'}</button>}</div></td></tr>)}
+        {!items.length && <tr><td colSpan={5}><div className="table-empty">{loading ? 'Memuat kontak…' : search ? 'Tidak ada kontak yang cocok.' : 'Belum ada kontak. Tambahkan manual atau impor file.'}</div></td></tr>}
       </tbody></table></div>
     </div>
-    <form className="panel side-form" onSubmit={submit}><p className="eyebrow">KONTAK BARU</p><h2>Tambah penerima</h2><label>Nama lengkap<input required value={name} onChange={(e) => setName(e.target.value)} placeholder="Ahmad Fauzi" /></label><label>Nomor WhatsApp<input required value={phone} onChange={(e) => setPhone(e.target.value)} placeholder="0812 3456 7890" /></label><p className="hint">Nomor Indonesia otomatis dinormalisasi ke format 62…</p><button className="primary">Tambah kontak</button></form>
-  </div>
+    <form className="panel side-form" onSubmit={submit}><p className="eyebrow">{editingId ? 'EDIT KONTAK' : 'KONTAK BARU'}</p><h2>{editingId ? 'Perbarui penerima' : 'Tambah penerima'}</h2><label>Nama lengkap<input required value={name} onChange={(e) => setName(e.target.value)} placeholder="Ahmad Fauzi" /></label><label>Nomor WhatsApp<input required value={phone} onChange={(e) => setPhone(e.target.value)} placeholder="0812 3456 7890" /></label><label className="checkbox-row"><input type="checkbox" checked={whatsappOptIn} onChange={(e) => setWhatsappOptIn(e.target.checked)} /> Bersedia menerima WhatsApp</label><p className="hint">Nomor Indonesia otomatis dinormalisasi ke format 62…</p><button className="primary" disabled={!!busy}>{busy === 'save' ? 'Menyimpan…' : editingId ? 'Simpan perubahan' : 'Tambah kontak'}</button>{editingId && <button type="button" disabled={!!busy} onClick={() => { setEditingId(null); setName(''); setPhone(''); setWhatsappOptIn(true) }}>Batal</button>}</form>
+    </div>
+  </>
 }
 
 function TemplatesPage({ notify }: { notify: (v: string) => void }) {
   const [items, setItems] = useState<Template[]>([])
   const [name, setName] = useState('Reminder PBB')
   const [content, setContent] = useState('Halo {{nama}},\n\nKami mengingatkan kembali mengenai pembayaran PBB. Jika pembayaran telah dilakukan, pesan ini dapat diabaikan.\n\nTerima kasih.')
+  const [busy, setBusy] = useState(false)
+  const [editingId, setEditingId] = useState<string | null>(null)
   const load = () => api<Template[]>('/api/templates').then(setItems)
   useEffect(() => { load().catch(() => undefined) }, [])
-  async function submit(e: FormEvent) { e.preventDefault(); try { await api('/api/templates', { method: 'POST', body: JSON.stringify({ name, content }) }); await load(); notify('Template berhasil disimpan') } catch (e) { notify(e instanceof Error ? e.message : 'Gagal menyimpan') } }
-  return <div className="split-layout"><div className="panel grow"><div className="panel-head"><div><h2>Template tersimpan</h2><p>Gunakan <code>{'{{nama}}'}</code> untuk personalisasi.</p></div></div><div className="template-list">{items.map((t) => <article className="template-card" key={t.id}><div><strong>{t.name}</strong><span className="badge success">Aktif</span></div><pre>{t.content}</pre></article>)}{!items.length && <div className="table-empty">Belum ada template.</div>}</div></div><form className="panel side-form wide" onSubmit={submit}><p className="eyebrow">TEMPLATE BARU</p><h2>Tulis pesan</h2><label>Nama template<input value={name} onChange={(e) => setName(e.target.value)} /></label><label>Isi pesan<textarea rows={11} value={content} onChange={(e) => setContent(e.target.value)} /></label><div className="preview"><small>Preview</small><p>{content.replace(/{{\s*nama\s*}}/gi, 'Ahmad Fauzi')}</p></div><button className="primary">Simpan template</button></form></div>
+  function resetForm() {
+    setEditingId(null)
+    setName('Reminder PBB')
+    setContent('Halo {{nama}},\n\nKami mengingatkan kembali mengenai pembayaran PBB. Jika pembayaran telah dilakukan, pesan ini dapat diabaikan.\n\nTerima kasih.')
+  }
+  function edit(template: Template) {
+    setEditingId(template.id)
+    setName(template.name)
+    setContent(template.content)
+  }
+  async function submit(e: FormEvent) {
+    e.preventDefault()
+    if (busy) return
+    setBusy(true)
+    try {
+      await api(editingId ? `/api/templates/${editingId}` : '/api/templates', {
+        method: editingId ? 'PATCH' : 'POST',
+        body: JSON.stringify({ name, content }),
+      })
+      await load()
+      notify(editingId ? 'Template berhasil diperbarui' : 'Template berhasil disimpan')
+      resetForm()
+    } catch (e) { notify(e instanceof Error ? e.message : 'Gagal menyimpan') }
+    finally { setBusy(false) }
+  }
+  async function deactivate(id: string) { if (!window.confirm('Nonaktifkan template ini? Campaign yang sudah dibuat tidak berubah.')) return; setBusy(true); try { await api(`/api/templates/${id}`, { method: 'DELETE' }); await load(); notify('Template dinonaktifkan') } catch (e) { notify(e instanceof Error ? e.message : 'Gagal menonaktifkan template') } finally { setBusy(false) } }
+  async function activate(id: string) { setBusy(true); try { await api(`/api/templates/${id}`, { method: 'PATCH', body: JSON.stringify({ isActive: true }) }); await load(); notify('Template diaktifkan kembali') } catch (e) { notify(e instanceof Error ? e.message : 'Gagal mengaktifkan template') } finally { setBusy(false) } }
+  return <div className="split-layout">
+    <div className="panel grow">
+      <div className="panel-head"><div><h2>Template tersimpan</h2><p>Gunakan <code>{'{{nama}}'}</code> untuk personalisasi.</p></div></div>
+      <div className="template-list">{items.map((template) => <article className="template-card" key={template.id}>
+        <div><strong>{template.name}</strong><div className="row-actions"><span className={template.isActive ? 'badge success' : 'badge'}>{template.isActive ? 'Aktif' : 'Nonaktif'}</span><button disabled={busy} onClick={() => edit(template)}>Edit</button>{template.isActive ? <button disabled={busy} onClick={() => deactivate(template.id)}>Nonaktifkan</button> : <button disabled={busy} onClick={() => activate(template.id)}>Aktifkan</button>}</div></div>
+        <pre>{template.content}</pre>
+      </article>)}{!items.length && <div className="table-empty">Belum ada template.</div>}</div>
+    </div>
+    <form className="panel side-form wide" onSubmit={submit}>
+      <p className="eyebrow">{editingId ? 'EDIT TEMPLATE' : 'TEMPLATE BARU'}</p><h2>{editingId ? 'Perbarui pesan' : 'Tulis pesan'}</h2>
+      <label>Nama template<input required value={name} onChange={(e) => setName(e.target.value)} /></label>
+      <label>Isi pesan<textarea required rows={11} value={content} onChange={(e) => setContent(e.target.value)} /></label>
+      <div className="preview"><small>Preview</small><p>{content.replace(/{{\s*nama\s*}}/gi, 'Ahmad Fauzi')}</p></div>
+      <button className="primary" disabled={busy}>{busy ? 'Menyimpan…' : editingId ? 'Simpan perubahan' : 'Simpan template'}</button>
+      {editingId && <button type="button" disabled={busy} onClick={resetForm}>Batal edit</button>}
+    </form>
+  </div>
 }
 
 function CampaignsPage({ notify }: { notify: (v: string) => void }) {
   const [campaigns, setCampaigns] = useState<Campaign[]>([])
   const [templates, setTemplates] = useState<Template[]>([])
+  const [contacts, setContacts] = useState<Contact[]>([])
+  const [selectedIds, setSelectedIds] = useState<string[]>([])
   const [name, setName] = useState('Reminder PBB')
   const [templateId, setTemplateId] = useState('')
   const [batchSize, setBatchSize] = useState(10)
-  const load = async () => { const [c, t] = await Promise.all([api<Campaign[]>('/api/campaigns'), api<Template[]>('/api/templates')]); setCampaigns(c); setTemplates(t); if (!templateId && t[0]) setTemplateId(t[0].id) }
+  const [preview, setPreview] = useState<CampaignPreview | null>(null)
+  const [busy, setBusy] = useState('')
+  const load = async () => {
+    const [c, t, availableContacts] = await Promise.all([api<Campaign[]>('/api/campaigns'), api<Template[]>('/api/templates'), api<Contact[]>('/api/contacts')])
+    const eligible = availableContacts.filter((contact) => contact.isActive && contact.whatsappOptIn)
+    setCampaigns(c); setTemplates(t); setContacts(eligible)
+    setSelectedIds((current) => current.length ? current : eligible.map((contact) => contact.id))
+    const firstActiveTemplate = t.find((template) => template.isActive)
+    if (!templateId && firstActiveTemplate) setTemplateId(firstActiveTemplate.id)
+  }
   useEffect(() => { load().catch(() => undefined) }, [])
+  useEffect(() => {
+    const timer = window.setInterval(() => api<Campaign[]>('/api/campaigns').then(setCampaigns).catch(() => undefined), 8000)
+    return () => window.clearInterval(timer)
+  }, [])
   const selectedTemplate = useMemo(() => templates.find((t) => t.id === templateId), [templates, templateId])
-  async function create(e: FormEvent) { e.preventDefault(); try { const result = await api<{ recipientCount: number }>('/api/campaigns', { method: 'POST', body: JSON.stringify({ name, templateId, batchSize }) }); await load(); notify(`Campaign dibuat untuk ${result.recipientCount} kontak`) } catch (e) { notify(e instanceof Error ? e.message : 'Gagal membuat campaign') } }
-  async function action(id: string, actionName: string) { try { await api(`/api/campaigns/${id}/${actionName}`, { method: 'POST' }); await load(); notify(`Campaign: ${actionName}`) } catch (e) { notify(e instanceof Error ? e.message : 'Gagal') } }
-  return <div className="split-layout"><div className="panel grow"><div className="panel-head"><div><h2>Campaign</h2><p>Campaign dibuat sebagai queue, bukan langsung blast.</p></div></div><div className="campaign-list">{campaigns.map((c) => <article className="campaign-row" key={c.id}><div><strong>{c.name}</strong><p>{new Date(c.createdAt).toLocaleString('id-ID')} · batch {c.batchSize}</p></div><div className="row-actions"><span className={`badge ${c.status === 'RUNNING' ? 'success' : ''}`}>{c.status}</span>{c.status === 'DRAFT' && <button onClick={() => action(c.id, 'start')}>Mulai</button>}{c.status === 'RUNNING' && <button onClick={() => action(c.id, 'pause')}>Pause</button>}{c.status === 'PAUSED' && <button onClick={() => action(c.id, 'resume')}>Resume</button>}</div></article>)}{!campaigns.length && <div className="table-empty">Belum ada campaign.</div>}</div></div><form className="panel side-form wide" onSubmit={create}><p className="eyebrow">CAMPAIGN BARU</p><h2>Siapkan antrean</h2><label>Nama campaign<input value={name} onChange={(e) => setName(e.target.value)} /></label><label>Template<select required value={templateId} onChange={(e) => setTemplateId(e.target.value)}><option value="">Pilih template</option>{templates.map((t) => <option key={t.id} value={t.id}>{t.name}</option>)}</select></label><label>Ukuran batch<input type="number" min={1} max={50} value={batchSize} onChange={(e) => setBatchSize(Number(e.target.value))} /></label><div className="preview"><small>Preview template</small><p>{selectedTemplate?.content.replace(/{{\s*nama\s*}}/gi, 'Ahmad Fauzi') ?? 'Pilih template terlebih dahulu.'}</p></div><p className="hint">V1 menggunakan semua kontak aktif yang opt-in. Pemilihan kontak individual menyusul.</p><button className="primary" disabled={!templateId}>Buat campaign draft</button></form></div>
+  const payload = () => ({ name, templateId, batchSize, contactIds: selectedIds })
+  async function runPreview() {
+    setBusy('preview')
+    try { setPreview(await api<CampaignPreview>('/api/campaigns/preview', { method: 'POST', body: JSON.stringify(payload()) })) }
+    catch (e) { setPreview(null); notify(e instanceof Error ? e.message : 'Gagal membuat preview') }
+    finally { setBusy('') }
+  }
+  async function create(e: FormEvent) {
+    e.preventDefault()
+    if (!preview) return runPreview()
+    if (busy) return
+    setBusy('create')
+    try {
+      const result = await api<{ recipientCount: number }>('/api/campaigns', { method: 'POST', body: JSON.stringify(payload()) })
+      setPreview(null); await load(); notify(`Campaign dibuat untuk ${result.recipientCount} kontak`)
+    } catch (e) { notify(e instanceof Error ? e.message : 'Gagal membuat campaign') }
+    finally { setBusy('') }
+  }
+  async function action(id: string, actionName: string) {
+    if (actionName === 'start' && !window.confirm('Mulai campaign ini? Dispatcher dapat mengirim pesan pada jadwal berikutnya.')) return
+    if (actionName === 'cancel' && !window.confirm('Batalkan campaign ini? Job yang masih mengantre tidak akan dikirim.')) return
+    setBusy(`${id}-${actionName}`)
+    try { await api(`/api/campaigns/${id}/${actionName}`, { method: 'POST' }); await load(); notify(`Status campaign berhasil diperbarui`) } catch (e) { notify(e instanceof Error ? e.message : 'Gagal') }
+    finally { setBusy('') }
+  }
+  function toggleContact(id: string) {
+    setPreview(null)
+    setSelectedIds((current) => current.includes(id) ? current.filter((item) => item !== id) : [...current, id])
+  }
+  return <div className="split-layout"><div className="panel grow"><div className="panel-head"><div><h2>Campaign</h2><p>Campaign dibuat sebagai queue, bukan langsung blast.</p></div><span className="live-indicator"><i /> diperbarui otomatis</span></div><div className="campaign-list">{campaigns.map((c) => { const progress = c.recipientCount ? Math.round((c.sentCount / c.recipientCount) * 100) : 0; return <article className="campaign-card" key={c.id}><div className="campaign-row"><div><strong>{c.name}</strong><p>{new Date(c.createdAt).toLocaleString('id-ID')} · batch {c.batchSize}</p></div><div className="row-actions"><span className={`badge ${['RUNNING', 'COMPLETED'].includes(c.status) ? 'success' : c.status === 'CANCELLED' ? 'danger' : ''}`}>{c.status}</span>{c.status === 'DRAFT' && <button disabled={!!busy} onClick={() => action(c.id, 'start')}>Mulai</button>}{c.status === 'RUNNING' && <button disabled={!!busy} onClick={() => action(c.id, 'pause')}>Pause</button>}{c.status === 'PAUSED' && <button disabled={!!busy} onClick={() => action(c.id, 'resume')}>Resume</button>}{['DRAFT', 'RUNNING', 'PAUSED'].includes(c.status) && <button disabled={!!busy} onClick={() => action(c.id, 'cancel')}>Batalkan</button>}</div></div><div className="campaign-progress"><div><span style={{ width: `${progress}%` }} /></div><p><strong>{c.sentCount}/{c.recipientCount}</strong> terkirim <span>{c.queuedCount} antre · {c.failedCount} gagal</span></p></div></article> })}{!campaigns.length && <div className="table-empty">Belum ada campaign.</div>}</div></div><form className="panel side-form wide" onSubmit={create}><p className="eyebrow">CAMPAIGN BARU</p><h2>Siapkan antrean</h2><label>Nama campaign<input value={name} onChange={(e) => { setName(e.target.value); setPreview(null) }} /></label><label>Template<select required value={templateId} onChange={(e) => { setTemplateId(e.target.value); setPreview(null) }}><option value="">Pilih template</option>{templates.filter((t) => t.isActive).map((t) => <option key={t.id} value={t.id}>{t.name}</option>)}</select></label><label>Ukuran batch<input type="number" min={1} max={50} value={batchSize} onChange={(e) => { setBatchSize(Number(e.target.value)); setPreview(null) }} /></label><fieldset className="recipient-picker"><legend>Penerima ({selectedIds.length}/{contacts.length})</legend><div className="recipient-tools"><button type="button" onClick={() => { setSelectedIds(contacts.map((contact) => contact.id)); setPreview(null) }}>Pilih semua</button><button type="button" onClick={() => { setSelectedIds([]); setPreview(null) }}>Kosongkan</button></div><div>{contacts.map((contact) => <label className="checkbox-row" key={contact.id}><input type="checkbox" checked={selectedIds.includes(contact.id)} onChange={() => toggleContact(contact.id)} /><span>{contact.fullName}<small>{contact.phoneNormalized}</small></span></label>)}</div></fieldset>{preview ? <div className="preview"><small>Preview final · {preview.recipientCount} penerima</small>{preview.samples.map((sample) => <p key={sample.contactId}><strong>{sample.fullName}</strong><br />{sample.renderedMessage}</p>)}</div> : <div className="preview"><small>Preview template</small><p>{selectedTemplate?.content.replace(/{{\s*nama\s*}}/gi, 'Ahmad Fauzi') ?? 'Pilih template terlebih dahulu.'}</p></div>}<button type="button" onClick={runPreview} disabled={!!busy || !templateId || !selectedIds.length}>{busy === 'preview' ? 'Menyiapkan preview…' : 'Tinjau campaign'}</button><button className="primary" disabled={!!busy || !preview}>{busy === 'create' ? 'Membuat antrean…' : preview ? 'Konfirmasi & buat draft' : 'Tinjau dahulu'}</button></form></div>
 }
 
-function HistoryPage() {
+function HistoryPage({ notify }: { notify: (v: string) => void }) {
   const [items, setItems] = useState<Message[]>([])
-  useEffect(() => { api<Message[]>('/api/messages').then(setItems).catch(() => undefined) }, [])
-  return <div className="panel"><div className="panel-head"><div><h2>Riwayat pesan</h2><p>200 job terbaru.</p></div></div><div className="table-wrap"><table><thead><tr><th>Penerima</th><th>Pesan</th><th>Status</th><th>Waktu</th></tr></thead><tbody>{items.map((m) => <tr key={m.id}><td className="mono">{m.recipient}</td><td className="message-cell">{m.renderedMessage}</td><td><span className={`badge ${m.status === 'SENT' ? 'success' : m.status === 'FAILED' ? 'danger' : ''}`}>{m.status}</span></td><td>{new Date(m.createdAt).toLocaleString('id-ID')}</td></tr>)}{!items.length && <tr><td colSpan={4}><div className="table-empty">Belum ada message job.</div></td></tr>}</tbody></table></div></div>
+  const [status, setStatus] = useState('ALL')
+  const [search, setSearch] = useState('')
+  const [loading, setLoading] = useState(true)
+  const load = async (silent = false) => {
+    if (!silent) setLoading(true)
+    try { setItems(await api<Message[]>('/api/messages')) }
+    catch (caught) { if (!silent) notify(caught instanceof Error ? caught.message : 'Riwayat tidak dapat dimuat') }
+    finally { if (!silent) setLoading(false) }
+  }
+  useEffect(() => {
+    load()
+    const timer = window.setInterval(() => load(true), 7000)
+    return () => window.clearInterval(timer)
+  }, [])
+  const filtered = useMemo(() => items.filter((item) => {
+    const statusMatches = status === 'ALL' || item.status === status
+    const needle = search.trim().toLowerCase()
+    return statusMatches && (!needle || item.recipient.includes(needle) || item.renderedMessage.toLowerCase().includes(needle))
+  }), [items, search, status])
+  const counts = useMemo(() => ({ sent: items.filter((item) => item.status === 'SENT').length, queued: items.filter((item) => ['QUEUED', 'PROCESSING'].includes(item.status)).length, failed: items.filter((item) => item.status === 'FAILED').length }), [items])
+  async function retry(id: string) {
+    if (!window.confirm('Antrekan ulang pesan ini? Pesan dapat terkirim saat dispatcher berikutnya berjalan.')) return
+    try {
+      await api(`/api/messages/${id}/retry`, { method: 'POST' })
+      await load()
+      notify('Message job kembali masuk antrean')
+    } catch (e) { notify(e instanceof Error ? e.message : 'Gagal retry message job') }
+  }
+  return <div className="panel"><div className="panel-head"><div><h2>Riwayat pesan</h2><p>200 job terbaru · daftar diperbarui otomatis setiap 7 detik.</p></div><button onClick={() => load()} disabled={loading}>{loading ? 'Memuat…' : '↻ Muat ulang'}</button></div><div className="history-summary"><span><i className="sent" />{counts.sent} terkirim</span><span><i className="queued" />{counts.queued} diproses</span><span><i className="failed" />{counts.failed} gagal</span></div><div className="filter-bar"><input className="search" placeholder="Cari nomor atau isi pesan…" value={search} onChange={(event) => setSearch(event.target.value)} /><select value={status} onChange={(event) => setStatus(event.target.value)}><option value="ALL">Semua status</option><option value="QUEUED">Queued</option><option value="PROCESSING">Processing</option><option value="SENT">Sent</option><option value="FAILED">Failed</option><option value="CANCELLED">Cancelled</option></select><span>{filtered.length} hasil</span></div><div className="table-wrap"><table><thead><tr><th>Penerima</th><th>Pesan</th><th>Status</th><th>Percobaan</th><th>Waktu</th><th>Aksi</th></tr></thead><tbody>{filtered.map((m) => <tr key={m.id}><td className="mono">{m.recipient}</td><td className="message-cell">{m.renderedMessage}{m.errorMessage && <small className="job-error">{m.errorCode}: {m.errorMessage}</small>}</td><td><span className={`badge ${m.status === 'SENT' ? 'success' : m.status === 'FAILED' ? 'danger' : ''}`}>{m.status}</span></td><td>{m.attempts}/{m.maxAttempts}</td><td>{new Date(m.createdAt).toLocaleString('id-ID')}</td><td>{m.status === 'FAILED' && <button onClick={() => retry(m.id)}>Retry</button>}</td></tr>)}{!filtered.length && <tr><td colSpan={6}><div className="table-empty">{loading ? 'Memuat riwayat…' : items.length ? 'Tidak ada job yang cocok dengan filter.' : 'Belum ada message job.'}</div></td></tr>}</tbody></table></div><p className="safety-note">Retry status FAILED dilakukan manual agar pengiriman dengan hasil tidak pasti tidak terduplikasi.</p></div>
 }
 
 function WhatsappPage({ notify }: { notify: (v: string) => void }) {

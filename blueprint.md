@@ -346,10 +346,19 @@ Tampilkan ringkas:
 Fitur:
 
 - tambah kontak
-- edit/hapus/nonaktifkan
+- edit/nonaktifkan/aktifkan kembali
 - search nama/nomor
 - pilih banyak kontak
-- import (setelah core CRUD stabil)
+- import CSV/XLSX dengan preview dan hasil per baris
+
+Kontrak import V1:
+
+- maksimal 1.000 baris dan 5 MB per file pada UI;
+- header wajib `Nama Lengkap` dan `Nomor WhatsApp`, sedangkan `Opt In` opsional;
+- nilai opt-in yang hilang/tidak eksplisit diperlakukan sebagai opt-out agar import tidak memberikan persetujuan secara implisit;
+- parsing CSV/XLSX dan preview dilakukan di browser, tetapi validasi serta normalisasi server tetap menjadi sumber kebenaran;
+- nomor duplikat dalam file atau yang sudah ada di database dilewati, bukan ditimpa;
+- baris invalid tidak menggagalkan seluruh file dan harus dilaporkan dengan nomor barisnya.
 
 Kolom awal hanya:
 
@@ -684,3 +693,22 @@ V1 dianggap siap pilot ketika:
 6. Jangan memperumit domain PBB sebelum core messaging stabil.
 7. Prioritaskan kode ringan, jelas, typed, dan mudah dipindahkan ke deployment resource kecil.
 8. Setiap perubahan schema/API yang signifikan harus diikuti update blueprint ini.
+
+## 21. Status implementasi terbaru (2026-09-16)
+
+Messaging engine V1 kini menggunakan keputusan operasional berikut:
+
+- Schema dikelola dengan migration SQL versioned di `apps/api/drizzle/`; `db:push` bukan lagi alur deployment utama. Render menjalankan migration terkompilasi sebelum API start. Koneksi memakai driver `pg`/Drizzle; `sslmode=require` dari URL Neon dinormalisasi runtime menjadi `verify-full` untuk mempertahankan verifikasi sertifikat pada versi driver mendatang.
+- Auth-state Baileys disimpan per akun/key di tabel `whatsapp_auth`, dienkripsi AES-256-GCM, dan ciphertext versi baru memakai AAD `accountId:key`. Pembacaan payload lama tanpa field versi tetap didukung. Update sekumpulan Signal keys dijalankan dalam transaksi database.
+- Disconnect manual tidak menghapus session. Event logout, bad session, atau multidevice mismatch menghapus auth-state rusak agar connect berikutnya dapat menghasilkan QR baru. Reconnect transient memakai exponential backoff sampai 60 detik.
+- Campaign UI sudah mendukung pemilihan kontak aktif yang opt-in dan preview server-side. Preview menampilkan jumlah penerima serta maksimal tiga snapshot pesan sebelum konfirmasi pembuatan draft.
+- Import kontak CSV/XLSX sudah tersedia melalui UI. XLSX dibaca secara lazy di browser, server memvalidasi ulang maksimal 1.000 baris, nomor dinormalisasi, dan konflik nomor dilewati secara aman. UI juga menampilkan preview dan ringkasan berhasil/duplikat/invalid.
+- Dashboard, daftar campaign, dan riwayat kini mempunyai refresh berkala/umpan balik proses. Campaign menampilkan progres terkirim/antre/gagal; riwayat dapat dicari dan difilter; aksi final meminta konfirmasi.
+- UI template sekarang mendukung edit, nonaktifkan, dan aktifkan kembali agar konsisten dengan kontrak API.
+- Claim dispatcher memakai `FOR UPDATE SKIP LOCKED`, processing token unik, batas batch campaign, serta unique constraint `(campaign_id, contact_id)`. Attempts dinaikkan saat claim dan update hasil hanya berlaku untuk token pemilik claim.
+- Setiap job menggunakan message ID Baileys stabil yang diturunkan dari ID job. Error sementara dijadwalkan ulang dengan exponential backoff dan batch dihentikan saat koneksi provider jatuh.
+- Job `PROCESSING` yang melewati timeout tidak otomatis diulang karena hasil kirim dapat tidak pasti. Job dipindah ke `FAILED` dengan `DELIVERY_UNKNOWN_AFTER_RESTART`; retry harus dipicu admin dari halaman Riwayat. Ini adalah kompromi V1 untuk memprioritaskan duplicate-send prevention.
+- API admin dilindungi JWT dan rate limit; login dibatasi lebih ketat. `/internal/dispatch` memakai bearer secret dengan constant-time comparison. `/health` memeriksa koneksi database.
+- Vite hanya membaca file environment di `apps/web`; `.env` root dikhususkan untuk backend agar `NODE_ENV` dan secret backend tidak memengaruhi atau ikut diproses build frontend.
+
+Migration dan smoke test health/login/dashboard terhadap Neon telah berhasil pada 2026-09-16; tujuh tabel aplikasi dan dua migration terkonfirmasi. Pairing WhatsApp, satu pengiriman pilot, serta restore session setelah API restart juga berhasil: status kembali `CONNECTED` tanpa QR baru. Validasi yang masih wajib sebelum pilot penuh adalah dispatch bertahap 5 → 10 → 25 → sekitar 100 nomor. Domain PBB kompleks tetap non-goal V1.

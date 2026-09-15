@@ -7,3 +7,4 @@ dist/
 *.log
 coverage/
 apps/web/.vite/
+*.tsbuildinfo

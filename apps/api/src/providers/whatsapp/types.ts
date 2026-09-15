@@ -9,10 +9,23 @@ export type MessagingState = {
 export type SendTextInput = {
   recipient: string
   text: string
+  idempotencyKey: string
 }
 
 export type SendResult = {
-  providerMessageId: string | null
+  providerMessageId: string
+}
+
+export class MessagingProviderError extends Error {
+  constructor(
+    message: string,
+    readonly code: string,
+    readonly retryable: boolean,
+    readonly deliveryUncertain = false,
+  ) {
+    super(message)
+    this.name = 'MessagingProviderError'
+  }
 }
 
 export interface MessagingProvider {
