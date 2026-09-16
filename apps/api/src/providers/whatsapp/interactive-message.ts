@@ -1,4 +1,4 @@
-import { extractUrlFromText, proto } from '@whiskeysockets/baileys'
+import { extractUrlFromText, proto, type BinaryNode } from '@whiskeysockets/baileys'
 
 export function extractInteractiveCtaUrl(text: string): string | undefined {
   const url = extractUrlFromText(text)
@@ -29,7 +29,6 @@ export function createInteractiveCtaMessage(input: InteractiveCtaInput): proto.I
     body: proto.Message.InteractiveMessage.Body.create({ text: input.text }),
     footer: proto.Message.InteractiveMessage.Footer.create({ text: input.footer }),
     nativeFlowMessage: proto.Message.InteractiveMessage.NativeFlowMessage.create({
-      messageVersion: 1,
       messageParamsJson: '',
       buttons: [proto.Message.InteractiveMessage.NativeFlowMessage.NativeFlowButton.create({
         name: 'cta_url',
@@ -43,12 +42,28 @@ export function createInteractiveCtaMessage(input: InteractiveCtaInput): proto.I
   })
 
   return proto.Message.create({
-    messageContextInfo: proto.MessageContextInfo.create({
-      deviceListMetadata: {},
-      deviceListMetadataVersion: 2,
-    }),
-    viewOnceMessage: proto.Message.FutureProofMessage.create({
+    // Patch multi-device yang dipakai klien WhatsApp untuk payload interactive.
+    documentWithCaptionMessage: proto.Message.FutureProofMessage.create({
       message: proto.Message.create({ interactiveMessage }),
     }),
   })
+}
+
+export function createInteractiveCtaRelayNodes(): BinaryNode[] {
+  return [
+    {
+      tag: 'biz',
+      attrs: {},
+      content: [{
+        tag: 'interactive',
+        attrs: { type: 'native_flow', v: '1' },
+        content: [{
+          tag: 'native_flow',
+          attrs: { v: '9', name: 'mixed' },
+        }],
+      }],
+    },
+    // Chat 1:1 membutuhkan penanda bot bisnis agar native-flow dirender.
+    { tag: 'bot', attrs: { biz_bot: '1' } },
+  ]
 }

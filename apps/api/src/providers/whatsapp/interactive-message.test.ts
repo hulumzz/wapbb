@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
 import { proto } from '@whiskeysockets/baileys'
-import { createInteractiveCtaMessage, extractInteractiveCtaUrl } from './interactive-message.js'
+import { createInteractiveCtaMessage, createInteractiveCtaRelayNodes, extractInteractiveCtaUrl } from './interactive-message.js'
 
 test('mengambil URL HTTPS pertama untuk tombol CTA', () => {
   assert.equal(
@@ -19,7 +19,7 @@ test('membentuk native-flow CTA URL yang dapat diencode Baileys', () => {
     label: 'Buka informasi',
     footer: 'Eksperimen WAPBB',
   })
-  const interactive = message.viewOnceMessage?.message?.interactiveMessage
+  const interactive = message.documentWithCaptionMessage?.message?.interactiveMessage
   const button = interactive?.nativeFlowMessage?.buttons?.[0]
 
   assert.equal(interactive?.body?.text, 'Halo Ahmad, lihat informasi PBB berikut.')
@@ -47,7 +47,18 @@ test('menyertakan imageMessage sebagai header media', () => {
     imageMessage,
   })
 
-  const header = message.viewOnceMessage?.message?.interactiveMessage?.header
+  const header = message.documentWithCaptionMessage?.message?.interactiveMessage?.header
   assert.equal(header?.hasMediaAttachment, true)
   assert.equal(header?.imageMessage?.mimetype, 'image/png')
+})
+
+test('menambahkan node relay biz native-flow dan bot untuk chat privat', () => {
+  const nodes = createInteractiveCtaRelayNodes()
+  const bizContent = nodes[0]?.content
+  assert.ok(Array.isArray(bizContent))
+  const interactiveNode = bizContent[0]
+  assert.equal(nodes[0]?.tag, 'biz')
+  assert.ok(typeof interactiveNode === 'object' && interactiveNode !== null && 'tag' in interactiveNode)
+  assert.equal(interactiveNode.tag, 'interactive')
+  assert.deepEqual(nodes[1], { tag: 'bot', attrs: { biz_bot: '1' } })
 })

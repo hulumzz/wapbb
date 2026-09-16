@@ -6,7 +6,7 @@ import { db } from '../../db/client.js'
 import { messageJobs, whatsappAccounts } from '../../db/schema.js'
 import { createSqlAuthState, hasStoredAuthState } from './sql-auth-state.js'
 import { createImageMessageContent, fetchRemoteImage, RemoteImageError, type RemoteImage } from './remote-image.js'
-import { createInteractiveCtaMessage, extractInteractiveCtaUrl } from './interactive-message.js'
+import { createInteractiveCtaMessage, createInteractiveCtaRelayNodes, extractInteractiveCtaUrl } from './interactive-message.js'
 import { MessagingProviderError, type MessagingProvider, type MessagingState, type SendImageInput, type SendTextInput, type SendResult } from './types.js'
 import { createStableMessageId } from '../../utils/idempotency.js'
 
@@ -259,7 +259,10 @@ export class BaileysProvider implements MessagingProvider {
     })
 
     try {
-      const providerMessageId = await socket.relayMessage(jid, content, { messageId })
+      const providerMessageId = await socket.relayMessage(jid, content, {
+        messageId,
+        additionalNodes: createInteractiveCtaRelayNodes(),
+      })
       if (!providerMessageId) {
         throw new MessagingProviderError('Provider tidak mengembalikan ID pesan interaktif', 'MISSING_MESSAGE_ID', true, true)
       }
