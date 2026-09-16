@@ -39,6 +39,9 @@ const envSchema = z.object({
     (value) => value.startsWith('https://'),
     'DEFAULT_BANNER_URL harus menggunakan HTTPS',
   ).default('https://i.ibb.co.com/fVFQc0HD/Chat-GPT-Image-16-Sep-2026-11-08-14-1-2.png'),
+  EXPERIMENTAL_INTERACTIVE_CTA: z.enum(['true', 'false']).default('false').transform((value) => value === 'true'),
+  EXPERIMENTAL_CTA_LABEL: z.string().trim().min(1).max(25).default('Buka link'),
+  EXPERIMENTAL_CTA_FOOTER: z.string().trim().max(60).default('Eksperimen WAPBB'),
 })
 
 export const config = envSchema.parse(process.env)

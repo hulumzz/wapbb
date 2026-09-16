@@ -110,6 +110,12 @@ Default batch saat ini adalah 10, tetapi dapat diubah per campaign. Batch diguna
 
 Campaign dapat berjalan sebagai text-only atau menggunakan banner. Banner diambil dari `DEFAULT_BANNER_URL` saat dispatch, tidak disimpan ke database/filesystem, dan dikirim sebagai media image dengan snapshot template sebagai caption. Pesan text-only yang memuat URL memakai link preview Baileys; kegagalan membuat preview tidak membatalkan pengiriman teks.
 
+### Eksperimen tombol CTA lokal
+
+Branch eksperimen menyediakan native-flow `cta_url` Baileys yang default-nya mati. Untuk mengujinya, tambahkan `EXPERIMENTAL_INTERACTIVE_CTA=true` ke `.env`, pastikan template berisi URL HTTPS publik, lalu restart API. Label dan footer dapat diubah melalui `EXPERIMENTAL_CTA_LABEL` dan `EXPERIMENTAL_CTA_FOOTER`. Jika URL tidak ditemukan, provider otomatis kembali ke pesan normal.
+
+Fitur ini memakai struktur protokol internal WhatsApp Web dan tidak dijamin tampil pada semua versi klien. Uji hanya ke satu kontak terlebih dahulu; jangan aktifkan pada Render atau campaign produksi sebelum hasilnya dinilai.
+
 Workflow contoh tersedia di `.github/workflows/dispatcher.yml`. Tambahkan repository secrets:
 
 - `DISPATCH_URL`, contoh `https://service.example.com/internal/dispatch`

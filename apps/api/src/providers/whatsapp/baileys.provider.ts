@@ -1,10 +1,12 @@
-import makeWASocket, { DisconnectReason, type AnyMessageContent, type ConnectionState, type WASocket } from '@whiskeysockets/baileys'
+import makeWASocket, { DisconnectReason, prepareWAMessageMedia, type AnyMessageContent, type ConnectionState, type WASocket } from '@whiskeysockets/baileys'
 import QRCode from 'qrcode'
 import { eq } from 'drizzle-orm'
+import { config } from '../../config.js'
 import { db } from '../../db/client.js'
 import { messageJobs, whatsappAccounts } from '../../db/schema.js'
 import { createSqlAuthState, hasStoredAuthState } from './sql-auth-state.js'
 import { createImageMessageContent, fetchRemoteImage, RemoteImageError, type RemoteImage } from './remote-image.js'
+import { createInteractiveCtaMessage, extractInteractiveCtaUrl } from './interactive-message.js'
 import { MessagingProviderError, type MessagingProvider, type MessagingState, type SendImageInput, type SendTextInput, type SendResult } from './types.js'
 import { createStableMessageId } from '../../utils/idempotency.js'
 
@@ -157,6 +159,10 @@ export class BaileysProvider implements MessagingProvider {
   async sendText(input: SendTextInput): Promise<SendResult> {
     const socket = this.requireConnectedSocket()
     await this.validateRecipient(socket, input.recipient)
+    const ctaUrl = config.EXPERIMENTAL_INTERACTIVE_CTA ? extractInteractiveCtaUrl(input.text) : undefined
+    if (ctaUrl) {
+      return this.sendInteractiveCta(socket, input.recipient, input.idempotencyKey, input.text, ctaUrl)
+    }
     return this.sendContent(socket, input.recipient, input.idempotencyKey, { text: input.text })
   }
 
@@ -174,6 +180,10 @@ export class BaileysProvider implements MessagingProvider {
       throw new MessagingProviderError('Banner campaign tidak dapat disiapkan', 'BANNER_FETCH_FAILED', true)
     }
 
+    const ctaUrl = config.EXPERIMENTAL_INTERACTIVE_CTA ? extractInteractiveCtaUrl(input.caption) : undefined
+    if (ctaUrl) {
+      return this.sendInteractiveCta(socket, input.recipient, input.idempotencyKey, input.caption, ctaUrl, image)
+    }
     return this.sendContent(socket, input.recipient, input.idempotencyKey, createImageMessageContent(image, input.caption))
   }
 
@@ -208,21 +218,72 @@ export class BaileysProvider implements MessagingProvider {
       }
       return { providerMessageId: result.key.id }
     } catch (error) {
-      if (error instanceof MessagingProviderError) throw error
-      const statusCode = (error as { output?: { statusCode?: number } } | undefined)?.output?.statusCode
-      if (statusCode === 400 || statusCode === 404) {
-        throw new MessagingProviderError('Nomor WhatsApp ditolak provider', 'INVALID_RECIPIENT', false)
-      }
-      if (statusCode === DisconnectReason.loggedOut || statusCode === DisconnectReason.forbidden) {
-        throw new MessagingProviderError('Session WhatsApp tidak lagi valid', 'PROVIDER_DISCONNECTED', true)
-      }
-      if (statusCode === DisconnectReason.connectionClosed
-        || statusCode === DisconnectReason.connectionLost
-        || statusCode === DisconnectReason.unavailableService) {
-        throw new MessagingProviderError('Koneksi WhatsApp terputus saat pengiriman', 'PROVIDER_DISCONNECTED', true, true)
-      }
-      throw new MessagingProviderError('Pengiriman WhatsApp tidak terkonfirmasi', 'DELIVERY_UNCERTAIN', true, true)
+      throw this.mapSendError(error)
     }
+  }
+
+  private async sendInteractiveCta(
+    socket: WASocket,
+    recipient: string,
+    idempotencyKey: string,
+    text: string,
+    url: string,
+    image?: RemoteImage,
+  ): Promise<SendResult> {
+    let imageMessage
+    if (image) {
+      try {
+        const prepared = await prepareWAMessageMedia({
+          image: image.data,
+          mimetype: image.mimetype,
+        }, {
+          upload: socket.waUploadToServer,
+        })
+        imageMessage = prepared.imageMessage ?? undefined
+        if (!imageMessage) {
+          throw new Error('Baileys tidak menghasilkan imageMessage')
+        }
+      } catch {
+        throw new MessagingProviderError('Upload banner untuk pesan interaktif gagal', 'BANNER_UPLOAD_FAILED', true)
+      }
+    }
+
+    const jid = `${recipient}@s.whatsapp.net`
+    const messageId = createStableMessageId(idempotencyKey)
+    const content = createInteractiveCtaMessage({
+      text,
+      url,
+      label: config.EXPERIMENTAL_CTA_LABEL,
+      footer: config.EXPERIMENTAL_CTA_FOOTER,
+      imageMessage,
+    })
+
+    try {
+      const providerMessageId = await socket.relayMessage(jid, content, { messageId })
+      if (!providerMessageId) {
+        throw new MessagingProviderError('Provider tidak mengembalikan ID pesan interaktif', 'MISSING_MESSAGE_ID', true, true)
+      }
+      return { providerMessageId }
+    } catch (error) {
+      throw this.mapSendError(error)
+    }
+  }
+
+  private mapSendError(error: unknown): MessagingProviderError {
+    if (error instanceof MessagingProviderError) return error
+    const statusCode = (error as { output?: { statusCode?: number } } | undefined)?.output?.statusCode
+    if (statusCode === 400 || statusCode === 404) {
+      return new MessagingProviderError('Nomor WhatsApp ditolak provider', 'INVALID_RECIPIENT', false)
+    }
+    if (statusCode === DisconnectReason.loggedOut || statusCode === DisconnectReason.forbidden) {
+      return new MessagingProviderError('Session WhatsApp tidak lagi valid', 'PROVIDER_DISCONNECTED', true)
+    }
+    if (statusCode === DisconnectReason.connectionClosed
+      || statusCode === DisconnectReason.connectionLost
+      || statusCode === DisconnectReason.unavailableService) {
+      return new MessagingProviderError('Koneksi WhatsApp terputus saat pengiriman', 'PROVIDER_DISCONNECTED', true, true)
+    }
+    return new MessagingProviderError('Pengiriman WhatsApp tidak terkonfirmasi', 'DELIVERY_UNCERTAIN', true, true)
   }
 
   private getRemoteImage(url: string): Promise<RemoteImage> {
