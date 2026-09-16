@@ -28,7 +28,7 @@ export async function buildApp() {
     credentials: true,
     strictPreflight: true,
     methods: ['GET', 'HEAD', 'POST', 'PATCH', 'DELETE', 'OPTIONS'],
-    allowedHeaders: ['Content-Type', 'Authorization'],
+    allowedHeaders: ['Content-Type', 'Authorization', 'Idempotency-Key'],
   })
   await app.register(jwt, { secret: config.AUTH_SECRET })
   await app.register(rateLimit, {
