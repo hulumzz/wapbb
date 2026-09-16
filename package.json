@@ -9,6 +9,7 @@
   "scripts": {
     "dev:api": "npm run dev -w @wapbb/api",
     "dev:web": "npm run dev -w @wapbb/web",
+    "dispatch:local": "powershell -NoProfile -ExecutionPolicy Bypass -File ./scripts/dispatch-local.ps1",
     "build": "npm run build -w @wapbb/api && npm run build -w @wapbb/web",
     "typecheck": "npm run typecheck -w @wapbb/api && npm run typecheck -w @wapbb/web",
     "test": "npm run test -w @wapbb/api && npm run test -w @wapbb/web",

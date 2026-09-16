@@ -1,16 +1,23 @@
 const API_URL = import.meta.env.VITE_API_URL ?? 'http://localhost:3000'
 export const AUTH_TOKEN_KEY = 'wapbb_admin_token'
+export const AUTH_USER_KEY = 'wapbb_admin_user'
 
 export function getAuthToken() {
   return localStorage.getItem(AUTH_TOKEN_KEY)
 }
 
-export function setAuthToken(token: string) {
+export function setAuthToken(token: string, username?: string) {
   localStorage.setItem(AUTH_TOKEN_KEY, token)
+  if (username) localStorage.setItem(AUTH_USER_KEY, username)
 }
 
 export function clearAuthToken() {
   localStorage.removeItem(AUTH_TOKEN_KEY)
+  localStorage.removeItem(AUTH_USER_KEY)
+}
+
+export function getAuthUser() {
+  return localStorage.getItem(AUTH_USER_KEY) ?? 'Administrator'
 }
 
 export async function api<T = any>(path: string, options: RequestInit = {}): Promise<T> {

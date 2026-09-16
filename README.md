@@ -104,17 +104,21 @@ QR baru hanya diperlukan ketika akun benar-benar logout, perangkat dihapus, atau
 
 Message tidak dikirim memakai proses `sleep()` panjang. Campaign menghasilkan queue di PostgreSQL. Scheduler eksternal memanggil `POST /internal/dispatch`, lalu dispatcher mengambil maksimal satu batch job yang eligible secara atomic dengan `FOR UPDATE SKIP LOCKED` dan processing token.
 
-Setiap job memakai message ID provider yang stabil dari ID job. Error sementara dijadwalkan ulang dengan backoff sampai `max_attempts`. Jika worker berhenti saat status job masih `PROCESSING`, job stale dipindahkan ke `FAILED` dengan kode `DELIVERY_UNKNOWN_AFTER_RESTART`, bukan otomatis dikirim ulang. Admin harus memeriksa lalu memilih Retry dari halaman Riwayat; kebijakan konservatif ini mengurangi risiko duplicate-send ketika provider sebenarnya sudah menerima pesan tetapi respons belum sempat disimpan.
+Setiap job memakai message ID provider yang stabil dari ID job dan ID tersebut dicatat sebelum relay dimulai. Error sementara yang dipastikan belum terkirim dijadwalkan ulang dengan backoff sampai `max_attempts`. Error dengan hasil kirim tidak pasti serta job `PROCESSING` yang stale dipindahkan ke `FAILED`/`UNKNOWN`, bukan otomatis dikirim ulang. Admin harus memeriksa lalu memilih **Antrekan ulang** dari halaman Riwayat; kebijakan konservatif ini mengurangi risiko pesan ganda.
+
+Status queue `SENT` dipertahankan untuk kompatibilitas rollback `main`, tetapi UI menampilkannya sebagai **Diserahkan**. Receipt Baileys disimpan terpisah sebagai `SERVER_ACK`, `DELIVERED`, `READ`, `PLAYED`, `ERROR`, atau `UNKNOWN`.
 
 Default batch saat ini adalah 10, tetapi dapat diubah per campaign. Batch digunakan untuk kontrol operasional dan resource, bukan sebagai jaminan untuk menghindari sistem anti-spam WhatsApp.
 
 Campaign dapat berjalan sebagai text-only atau menggunakan banner. Banner diambil dari `DEFAULT_BANNER_URL` saat dispatch, tidak disimpan ke database/filesystem, dan dikirim sebagai media image dengan snapshot template sebagai caption. Pesan text-only yang memuat URL memakai link preview Baileys; kegagalan membuat preview tidak membatalkan pengiriman teks.
 
-### Eksperimen tombol CTA lokal
+### Tombol tindakan WhatsApp
 
-Branch eksperimen menyediakan native-flow `cta_url` Baileys yang default-nya mati. Untuk mengujinya, tambahkan `EXPERIMENTAL_INTERACTIVE_CTA=true` ke `.env`, pastikan template berisi URL HTTPS publik, lalu restart API. Label dan footer dapat diubah melalui `EXPERIMENTAL_CTA_LABEL` dan `EXPERIMENTAL_CTA_FOOTER`. Jika URL tidak ditemukan, provider otomatis kembali ke pesan normal.
+Campaign dapat menambahkan tombol URL melalui toggle **Tombol tindakan**. Fitur tersedia ketika `INTERACTIVE_CTA_ENABLED=true` dan template memiliki URL HTTPS. Label serta footer dikonfigurasi melalui `INTERACTIVE_CTA_LABEL` dan `INTERACTIVE_CTA_FOOTER`, kemudian disalin ke message job agar retry tetap deterministik.
 
-Fitur ini memakai struktur protokol internal WhatsApp Web dan tidak dijamin tampil pada semua versi klien. Uji hanya ke satu kontak terlebih dahulu; jangan aktifkan pada Render atau campaign produksi sebelum hasilnya dinilai.
+Kill switch default tetap `false`. Setelah pilot perangkat berhasil, aktifkan environment tersebut di API Render. Jika kill switch dimatikan ketika masih ada job ber-CTA, dispatcher mengirim snapshot pesan sebagai text/image biasa. Kegagalan relay yang hasilnya tidak pasti tidak pernah diikuti fallback atau retry otomatis karena dapat menghasilkan pesan ganda.
+
+Fitur memakai native-flow protokol WhatsApp Web melalui Baileys. Status receipt membedakan pesan yang baru diserahkan, diterima server, terkirim ke perangkat, dan dibaca. Receipt perangkat tidak menjamin setiap versi aplikasi merender tombol dengan tampilan identik, sehingga pilot lintas Android/iOS/Web tetap diperlukan.
 
 Workflow contoh tersedia di `.github/workflows/dispatcher.yml`. Tambahkan repository secrets:
 
@@ -137,6 +141,8 @@ Saat membuat Blueprint di Render, isi environment yang masih `sync: false`:
 - `ADMIN_USERNAME`
 - `ADMIN_PASSWORD`
 - `DEFAULT_BANNER_URL` — opsional bila ingin mengganti banner bawaan
+- `INTERACTIVE_CTA_ENABLED` — ubah ke `true` setelah pilot tombol tindakan berhasil
+- `INTERACTIVE_CTA_LABEL` dan `INTERACTIVE_CTA_FOOTER` — label produksi yang disalin ke job
 
 `AUTH_SECRET`, `INTERNAL_DISPATCH_SECRET`, dan `WA_SESSION_ENCRYPTION_KEY` disiapkan untuk digenerate oleh Render. Simpan nilai `INTERNAL_DISPATCH_SECRET` jika scheduler eksternal akan digunakan.
 

@@ -1,10 +1,11 @@
 import { StrictMode } from 'react'
 import { createRoot } from 'react-dom/client'
-import App from './App'
+import App from './ProductionApp'
 import { AuthGate } from './AuthGate'
-import './styles.css'
-import './auth.css'
 import './operations.css'
+import './banner.css'
+import './auth.css'
+import './production.css'
 
 createRoot(document.getElementById('root')!).render(
   <StrictMode>

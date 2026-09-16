@@ -27,8 +27,18 @@ services:
         generateValue: true
       - key: DEFAULT_BATCH_SIZE
         value: "10"
+      - key: PROCESSING_TIMEOUT_MINUTES
+        value: "15"
+      - key: RETRY_DELAY_SECONDS
+        value: "60"
       - key: DEFAULT_BANNER_URL
         value: https://i.ibb.co.com/fVFQc0HD/Chat-GPT-Image-16-Sep-2026-11-08-14-1-2.png
+      - key: INTERACTIVE_CTA_ENABLED
+        value: "false"
+      - key: INTERACTIVE_CTA_LABEL
+        value: Buka informasi
+      - key: INTERACTIVE_CTA_FOOTER
+        value: Informasi resmi desa
 
   - type: web
     name: wapbb-web

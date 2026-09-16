@@ -73,15 +73,15 @@ export function ContactImportPanel({ onImported, notify }: { onImported: () => P
     </div>
     <label className={`file-drop ${rows.length ? 'ready' : ''}`}>
       <input key={inputKey} type="file" accept=".csv,.xlsx,text/csv,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" onChange={chooseFile} />
-      <span className="upload-icon">↑</span>
-      <strong>{reading ? 'Membaca file…' : fileName || 'Pilih file kontak'}</strong>
-      <small>CSV/XLSX · maksimal 1.000 baris · 5 MB</small>
+      <span className="upload-icon">FILE</span>
+      <strong>{reading ? 'Membaca file...' : fileName || 'Pilih file kontak'}</strong>
+      <small>CSV/XLSX | maksimal 1.000 baris | 5 MB</small>
     </label>
     {error && <div className="inline-alert danger">{error}</div>}
     {!!rows.length && <>
       <div className="import-summary"><strong>{rows.length}</strong><span>baris siap diperiksa server</span></div>
-      <div className="import-preview table-wrap"><table><thead><tr><th>Baris</th><th>Nama</th><th>Nomor</th><th>Opt-in</th></tr></thead><tbody>{rows.slice(0, 5).map((row) => <tr key={row.rowNumber}><td>{row.rowNumber}</td><td>{row.fullName || '—'}</td><td>{row.phone || '—'}</td><td>{row.whatsappOptIn ? 'Ya' : 'Tidak'}</td></tr>)}</tbody></table>{rows.length > 5 && <p className="preview-more">+ {rows.length - 5} baris lainnya</p>}</div>
-      <div className="import-actions"><button type="button" onClick={reset}>Ganti file</button><button className="primary" type="button" disabled={importing} onClick={submitImport}>{importing ? 'Mengimpor…' : `Impor ${rows.length} kontak`}</button></div>
+      <div className="import-preview table-wrap"><table><thead><tr><th>Baris</th><th>Nama</th><th>Nomor</th><th>Opt-in</th></tr></thead><tbody>{rows.slice(0, 5).map((row) => <tr key={row.rowNumber}><td>{row.rowNumber}</td><td>{row.fullName || '-'}</td><td>{row.phone || '-'}</td><td>{row.whatsappOptIn ? 'Ya' : 'Tidak'}</td></tr>)}</tbody></table>{rows.length > 5 && <p className="preview-more">+ {rows.length - 5} baris lainnya</p>}</div>
+      <div className="import-actions"><button type="button" onClick={reset}>Ganti file</button><button className="primary" type="button" disabled={importing} onClick={submitImport}>{importing ? 'Mengimpor...' : `Impor ${rows.length} kontak`}</button></div>
     </>}
     {result && <div className="import-result">
       <div><span><strong>{result.imported}</strong> berhasil</span><span><strong>{result.duplicates}</strong> duplikat</span><span><strong>{result.invalid}</strong> invalid</span></div>

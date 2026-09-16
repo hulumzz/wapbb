@@ -4,7 +4,10 @@ import { and, asc, eq, inArray, sql } from 'drizzle-orm'
 import { config } from '../config.js'
 import { db } from '../db/client.js'
 import { campaigns, messageJobs } from '../db/schema.js'
+import { confirmsSubmission } from '../providers/whatsapp/delivery-status.js'
+import { shouldRetryAutomatically } from '../providers/whatsapp/retry-policy.js'
 import { MessagingProviderError, type MessagingProvider } from '../providers/whatsapp/types.js'
+import { createStableMessageId } from '../utils/idempotency.js'
 import { safeSecretEqual } from '../utils/secret.js'
 
 export async function registerInternalRoutes(app: FastifyInstance, provider: MessagingProvider) {
@@ -32,6 +35,7 @@ export async function registerInternalRoutes(app: FastifyInstance, provider: Mes
       UPDATE message_jobs
       SET status = 'FAILED',
           processing_token = NULL,
+          delivery_status = 'UNKNOWN',
           error_code = 'DELIVERY_UNKNOWN_AFTER_RESTART',
           error_message = 'Status pengiriman tidak dapat dipastikan setelah worker berhenti. Periksa sebelum retry manual.',
           updated_at = NOW()
@@ -41,6 +45,7 @@ export async function registerInternalRoutes(app: FastifyInstance, provider: Mes
     await db.execute(sql`
       UPDATE message_jobs
       SET status = 'FAILED',
+          delivery_status = COALESCE(delivery_status, 'ERROR'),
           error_code = 'MAX_ATTEMPTS_REACHED',
           error_message = 'Batas percobaan pengiriman telah tercapai.',
           updated_at = NOW()
@@ -72,7 +77,8 @@ export async function registerInternalRoutes(app: FastifyInstance, provider: Mes
             error_message = NULL,
             updated_at = NOW()
         WHERE job.id IN (SELECT id FROM candidates)
-        RETURNING job.id, job.recipient, job.rendered_message, job.attempts, job.max_attempts
+        RETURNING job.id, job.recipient, job.rendered_message, job.attempts, job.max_attempts,
+          job.cta_url, job.cta_label, job.cta_footer
       `)
       return result.rows as Array<{
         id: string
@@ -80,6 +86,9 @@ export async function registerInternalRoutes(app: FastifyInstance, provider: Mes
         rendered_message: string
         attempts: number
         max_attempts: number
+        cta_url: string | null
+        cta_label: string | null
+        cta_footer: string | null
       }>
     })
 
@@ -89,6 +98,20 @@ export async function registerInternalRoutes(app: FastifyInstance, provider: Mes
     let circuitBroken = false
 
     for (const [index, job] of claimed.entries()) {
+      const stableMessageId = createStableMessageId(job.id)
+      await db.update(messageJobs).set({
+        providerMessageId: stableMessageId,
+        updatedAt: new Date(),
+      }).where(and(
+        eq(messageJobs.id, job.id),
+        eq(messageJobs.status, 'PROCESSING'),
+        eq(messageJobs.processingToken, processingToken),
+      ))
+
+      const interactiveCta = config.INTERACTIVE_CTA_ENABLED && job.cta_url && job.cta_label && job.cta_footer
+        ? { url: job.cta_url, label: job.cta_label, footer: job.cta_footer }
+        : undefined
+
       try {
         const result = campaign.useBanner
           ? await provider.sendImage({
@@ -96,16 +119,20 @@ export async function registerInternalRoutes(app: FastifyInstance, provider: Mes
               imageUrl: config.DEFAULT_BANNER_URL,
               caption: job.rendered_message,
               idempotencyKey: job.id,
+              interactiveCta,
             })
           : await provider.sendText({
               recipient: job.recipient,
               text: job.rendered_message,
               idempotencyKey: job.id,
+              interactiveCta,
             })
         await db.update(messageJobs).set({
           status: 'SENT',
           sentAt: new Date(),
           providerMessageId: result.providerMessageId,
+          deliveryStatus: sql`COALESCE(${messageJobs.deliveryStatus}, 'PENDING')`,
+          processingAt: null,
           processingToken: null,
           updatedAt: new Date(),
         }).where(and(
@@ -118,10 +145,33 @@ export async function registerInternalRoutes(app: FastifyInstance, provider: Mes
         const providerError = error instanceof MessagingProviderError
           ? error
           : new MessagingProviderError('Pengiriman gagal tanpa detail provider', 'PROVIDER_ERROR', false, true)
-        const shouldRetry = providerError.retryable && job.attempts < job.max_attempts
+        const [receipt] = await db.select({ deliveryStatus: messageJobs.deliveryStatus })
+          .from(messageJobs)
+          .where(eq(messageJobs.id, job.id))
+          .limit(1)
+        if (confirmsSubmission(receipt?.deliveryStatus)) {
+          await db.update(messageJobs).set({
+            status: 'SENT',
+            sentAt: new Date(),
+            processingAt: null,
+            processingToken: null,
+            errorCode: null,
+            errorMessage: null,
+            updatedAt: new Date(),
+          }).where(and(
+            eq(messageJobs.id, job.id),
+            eq(messageJobs.status, 'PROCESSING'),
+            eq(messageJobs.processingToken, processingToken),
+          ))
+          sent += 1
+          continue
+        }
+
+        const shouldRetry = shouldRetryAutomatically(providerError, job.attempts, job.max_attempts)
         const retryDelay = config.RETRY_DELAY_SECONDS * (2 ** Math.max(job.attempts - 1, 0))
         await db.update(messageJobs).set({
           status: shouldRetry ? 'QUEUED' : 'FAILED',
+          deliveryStatus: providerError.deliveryUncertain ? 'UNKNOWN' : shouldRetry ? null : 'ERROR',
           scheduledAt: shouldRetry ? new Date(Date.now() + retryDelay * 1000) : undefined,
           processingAt: null,
           processingToken: null,
@@ -172,6 +222,7 @@ export async function registerInternalRoutes(app: FastifyInstance, provider: Mes
     return {
       processed: sent + failed + retried,
       claimed: claimed.length,
+      submitted: sent,
       sent,
       failed,
       retried,

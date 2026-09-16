@@ -9,3 +9,5 @@ coverage/
 apps/web/.vite/
 *.tsbuildinfo
 render-log.md
+dispatch-local.ps1
+konteks.md

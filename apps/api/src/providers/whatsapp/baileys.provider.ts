@@ -1,13 +1,13 @@
-import makeWASocket, { DisconnectReason, prepareWAMessageMedia, type AnyMessageContent, type ConnectionState, type WASocket } from '@whiskeysockets/baileys'
+import makeWASocket, { DisconnectReason, prepareWAMessageMedia, type AnyMessageContent, type ConnectionState, type WAMessageUpdate, type WASocket } from '@whiskeysockets/baileys'
 import QRCode from 'qrcode'
-import { eq } from 'drizzle-orm'
-import { config } from '../../config.js'
+import { and, eq, inArray, isNull, or, sql } from 'drizzle-orm'
 import { db } from '../../db/client.js'
 import { messageJobs, whatsappAccounts } from '../../db/schema.js'
 import { createSqlAuthState, hasStoredAuthState } from './sql-auth-state.js'
 import { createImageMessageContent, fetchRemoteImage, RemoteImageError, type RemoteImage } from './remote-image.js'
-import { createInteractiveCtaMessage, createInteractiveCtaRelayNodes, extractInteractiveCtaUrl } from './interactive-message.js'
-import { MessagingProviderError, type MessagingProvider, type MessagingState, type SendImageInput, type SendTextInput, type SendResult } from './types.js'
+import { createInteractiveCtaMessage, createInteractiveCtaRelayNodes } from './interactive-message.js'
+import { allowedPreviousDeliveryStatuses, confirmsSubmission, mapBaileysDeliveryStatus, type DeliveryStatus } from './delivery-status.js'
+import { MessagingProviderError, type InteractiveCta, type MessagingProvider, type MessagingState, type SendImageInput, type SendTextInput, type SendResult } from './types.js'
 import { createStableMessageId } from '../../utils/idempotency.js'
 
 const ACCOUNT_ID = 'default'
@@ -73,6 +73,11 @@ export class BaileysProvider implements MessagingProvider {
     this.socket = socket
 
     socket.ev.on('creds.update', saveCreds)
+    socket.ev.on('messages.update', (updates) => {
+      void this.handleMessageUpdates(updates).catch((error) => {
+        console.error('Gagal menyimpan acknowledgement WhatsApp', error instanceof Error ? error.message : 'unknown error')
+      })
+    })
     socket.ev.on('connection.update', (update) => {
       void this.handleConnectionUpdate(socket, update, clear).catch(() => {
         if (this.socket === socket) {
@@ -159,9 +164,8 @@ export class BaileysProvider implements MessagingProvider {
   async sendText(input: SendTextInput): Promise<SendResult> {
     const socket = this.requireConnectedSocket()
     await this.validateRecipient(socket, input.recipient)
-    const ctaUrl = config.EXPERIMENTAL_INTERACTIVE_CTA ? extractInteractiveCtaUrl(input.text) : undefined
-    if (ctaUrl) {
-      return this.sendInteractiveCta(socket, input.recipient, input.idempotencyKey, input.text, ctaUrl)
+    if (input.interactiveCta) {
+      return this.sendInteractiveCta(socket, input.recipient, input.idempotencyKey, input.text, input.interactiveCta)
     }
     return this.sendContent(socket, input.recipient, input.idempotencyKey, { text: input.text })
   }
@@ -180,9 +184,8 @@ export class BaileysProvider implements MessagingProvider {
       throw new MessagingProviderError('Banner campaign tidak dapat disiapkan', 'BANNER_FETCH_FAILED', true)
     }
 
-    const ctaUrl = config.EXPERIMENTAL_INTERACTIVE_CTA ? extractInteractiveCtaUrl(input.caption) : undefined
-    if (ctaUrl) {
-      return this.sendInteractiveCta(socket, input.recipient, input.idempotencyKey, input.caption, ctaUrl, image)
+    if (input.interactiveCta) {
+      return this.sendInteractiveCta(socket, input.recipient, input.idempotencyKey, input.caption, input.interactiveCta, image)
     }
     return this.sendContent(socket, input.recipient, input.idempotencyKey, createImageMessageContent(image, input.caption))
   }
@@ -227,7 +230,7 @@ export class BaileysProvider implements MessagingProvider {
     recipient: string,
     idempotencyKey: string,
     text: string,
-    url: string,
+    interactiveCta: InteractiveCta,
     image?: RemoteImage,
   ): Promise<SendResult> {
     let imageMessage
@@ -252,9 +255,9 @@ export class BaileysProvider implements MessagingProvider {
     const messageId = createStableMessageId(idempotencyKey)
     const content = createInteractiveCtaMessage({
       text,
-      url,
-      label: config.EXPERIMENTAL_CTA_LABEL,
-      footer: config.EXPERIMENTAL_CTA_FOOTER,
+      url: interactiveCta.url,
+      label: interactiveCta.label,
+      footer: interactiveCta.footer,
       imageMessage,
     })
 
@@ -298,6 +301,63 @@ export class BaileysProvider implements MessagingProvider {
     })
     this.imageCache = { url, promise }
     return promise
+  }
+
+  private async handleMessageUpdates(updates: WAMessageUpdate[]): Promise<void> {
+    for (const item of updates) {
+      const providerMessageId = item.key.id
+      const deliveryStatus = mapBaileysDeliveryStatus(item.update.status)
+      if (!providerMessageId || !deliveryStatus) continue
+
+      const previousStatuses = allowedPreviousDeliveryStatuses(deliveryStatus)
+      const canAdvance = previousStatuses.length
+        ? or(isNull(messageJobs.deliveryStatus), inArray(messageJobs.deliveryStatus, previousStatuses))
+        : isNull(messageJobs.deliveryStatus)
+      const now = new Date()
+      const timestamps = this.deliveryTimestamps(deliveryStatus, now)
+      const queueUpdate = confirmsSubmission(deliveryStatus)
+        ? {
+            status: sql`CASE WHEN ${messageJobs.status} IN ('PROCESSING', 'FAILED') THEN 'SENT' ELSE ${messageJobs.status} END`,
+            sentAt: sql`COALESCE(${messageJobs.sentAt}, ${now})`,
+            processingAt: null,
+            processingToken: null,
+            errorCode: null,
+            errorMessage: null,
+          }
+        : deliveryStatus === 'ERROR'
+          ? {
+              status: sql`CASE WHEN ${messageJobs.status} IN ('PROCESSING', 'SENT') THEN 'FAILED' ELSE ${messageJobs.status} END`,
+              processingAt: null,
+              processingToken: null,
+              errorCode: 'PROVIDER_RECEIPT_ERROR',
+              errorMessage: 'WhatsApp melaporkan kegagalan pengantaran pesan.',
+            }
+          : {}
+
+      await db.update(messageJobs).set({
+        deliveryStatus,
+        ...timestamps,
+        ...queueUpdate,
+        updatedAt: now,
+      }).where(and(
+        eq(messageJobs.providerMessageId, providerMessageId),
+        canAdvance,
+      ))
+    }
+  }
+
+  private deliveryTimestamps(status: DeliveryStatus, now: Date) {
+    if (status === 'SERVER_ACK') return { serverAckAt: now }
+    if (status === 'DELIVERED') return {
+      serverAckAt: sql`COALESCE(${messageJobs.serverAckAt}, ${now})`,
+      deliveredAt: now,
+    }
+    if (status === 'READ' || status === 'PLAYED') return {
+      serverAckAt: sql`COALESCE(${messageJobs.serverAckAt}, ${now})`,
+      deliveredAt: sql`COALESCE(${messageJobs.deliveredAt}, ${now})`,
+      readAt: now,
+    }
+    return {}
   }
 
   private async ensureAccount(): Promise<void> {

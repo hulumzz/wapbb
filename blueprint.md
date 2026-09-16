@@ -228,6 +228,11 @@ template_id
 status
 batch_size
 use_banner
+use_interactive_cta
+cta_label
+cta_footer
+idempotency_key
+request_hash
 created_at
 updated_at
 started_at
@@ -270,6 +275,13 @@ scheduled_at
 processing_at
 sent_at
 provider_message_id
+delivery_status
+server_ack_at
+delivered_at
+read_at
+cta_url
+cta_label
+cta_footer
 error_code
 error_message
 created_at
@@ -419,6 +431,16 @@ Provider.sendText() / Provider.sendImage()
         ↓
 SENT / FAILED
 ```
+
+`SENT` dipertahankan sebagai nama status queue agar migration tetap kompatibel dengan versi `main`, tetapi semantiknya adalah **payload sudah diserahkan ke koneksi WhatsApp**, bukan bukti penerima sudah mendapat pesan. Konfirmasi aktual disimpan terpisah:
+
+```text
+PENDING -> SERVER_ACK -> DELIVERED -> READ / PLAYED
+                         -> ERROR
+        -> UNKNOWN
+```
+
+UI wajib memakai istilah "Diserahkan" untuk `SENT`, lalu menampilkan `delivery_status` secara terpisah. Receipt yang datang tidak boleh menurunkan status yang sudah lebih tinggi.
 
 Default `batch_size = 10`.
 
@@ -701,6 +723,13 @@ V1 dianggap siap pilot ketika:
 
 Messaging engine V1 kini menggunakan keputusan operasional berikut:
 
+- Kandidat production dikerjakan di branch `production/messaging-v1`; branch `main` tetap menjadi baseline stabil yang dapat dideploy kembali. Migration production harus tetap aditif dan kompatibel dengan kode `main`.
+- Tombol native-flow CTA tidak lagi diperlakukan sebagai mode eksperimen global. Campaign memiliki `use_interactive_cta`, sedangkan URL/label/footer disalin ke setiap message job agar retry deterministik. `INTERACTIVE_CTA_ENABLED` tetap menjadi kill switch server dan default-nya mati; jika dimatikan, job CTA dikirim melalui jalur text/image biasa tanpa tombol.
+- Dispatcher menyimpan stable provider message ID sebelum relay. Setelah relay berhasil, queue memakai status kompatibel `SENT` dengan arti "diserahkan" dan `delivery_status=PENDING`. Event `messages.update` Baileys memetakan acknowledgement menjadi `SERVER_ACK`, `DELIVERED`, `READ`, `PLAYED`, atau `ERROR` beserta timestamp.
+- Error dengan `deliveryUncertain=true` tidak pernah masuk retry otomatis. Job menjadi `FAILED` dengan `delivery_status=UNKNOWN`; retry hanya dapat dilakukan manual dengan peringatan risiko duplikasi. Bila acknowledgement sudah tersimpan walaupun pemanggilan send melempar error, job dipulihkan sebagai `SENT` dan tidak diulang.
+- UI production menggunakan label operasional berbahasa Indonesia, membedakan proses queue dari pengantaran, menyediakan CTA per campaign, dan tidak lagi menampilkan helper eksperimen/pilot sebagai identitas produk.
+- Pembuatan campaign menerima header `Idempotency-Key`. Payload yang sama mengembalikan draft yang sudah terbentuk, sedangkan penggunaan key yang sama untuk payload berbeda ditolak. Ini mencegah draft/queue ganda ketika respons create timeout atau operator mengirim ulang form.
+
 - Schema dikelola dengan migration SQL versioned di `apps/api/drizzle/`; `db:push` bukan lagi alur deployment utama. Render menjalankan migration terkompilasi sebelum API start. Koneksi memakai driver `pg`/Drizzle; `sslmode=require` dari URL Neon dinormalisasi runtime menjadi `verify-full` untuk mempertahankan verifikasi sertifikat pada versi driver mendatang.
 - Auth-state Baileys disimpan per akun/key di tabel `whatsapp_auth`, dienkripsi AES-256-GCM, dan ciphertext versi baru memakai AAD `accountId:key`. Pembacaan payload lama tanpa field versi tetap didukung. Update sekumpulan Signal keys dijalankan dalam transaksi database.
 - Disconnect manual tidak menghapus session. Event logout, bad session, atau multidevice mismatch menghapus auth-state rusak agar connect berikutnya dapat menghasilkan QR baru. Reconnect transient memakai exponential backoff sampai 60 detik.
@@ -711,10 +740,11 @@ Messaging engine V1 kini menggunakan keputusan operasional berikut:
 - Claim dispatcher memakai `FOR UPDATE SKIP LOCKED`, processing token unik, batas batch campaign, serta unique constraint `(campaign_id, contact_id)`. Attempts dinaikkan saat claim dan update hasil hanya berlaku untuk token pemilik claim.
 - Setiap job menggunakan message ID Baileys stabil yang diturunkan dari ID job. Error sementara dijadwalkan ulang dengan exponential backoff dan batch dihentikan saat koneksi provider jatuh.
 - Job `PROCESSING` yang melewati timeout tidak otomatis diulang karena hasil kirim dapat tidak pasti. Job dipindah ke `FAILED` dengan `DELIVERY_UNKNOWN_AFTER_RESTART`; retry harus dipicu admin dari halaman Riwayat. Ini adalah kompromi V1 untuk memprioritaskan duplicate-send prevention.
+- Retry manual job dilakukan dalam transaksi yang sama dengan penguncian job dan campaign. Jika job berada pada campaign `COMPLETED`, campaign dibuka kembali menjadi `RUNNING` agar dispatcher dapat memprosesnya; campaign `CANCELLED` tidak pernah dihidupkan kembali.
 - API admin dilindungi JWT dan rate limit; login dibatasi lebih ketat. `/internal/dispatch` memakai bearer secret dengan constant-time comparison. `/health` memeriksa koneksi database.
 - Vite hanya membaca file environment di `apps/web`; `.env` root dikhususkan untuk backend agar `NODE_ENV` dan secret backend tidak memengaruhi atau ikut diproses build frontend.
 - Pesan teks memakai generator link preview bawaan Baileys dengan `link-preview-js` 3.x dan high-quality preview diaktifkan. Kegagalan metadata/thumbnail tidak menggagalkan pengiriman teks.
 - Campaign memiliki flag `use_banner`. Jika aktif, API mengambil `DEFAULT_BANNER_URL` ke buffer memory sementara (timeout 15 detik, maksimal 5 MB), lalu Baileys mengirim image dengan snapshot pesan sebagai caption. File/base64 banner tidak disimpan ke database atau filesystem; kegagalan sumber media dicatat pada message job dan mengikuti aturan retry yang sama.
 - Dispatcher melakukan pengecekan campaign RUNNING sebelum status provider. Panggilan scheduler saat antrean campaign kosong menjadi no-op HTTP 200 sehingga tidak dilaporkan sebagai kegagalan hanya karena WhatsApp sedang disconnected.
 
-Migration dan smoke test health/login/dashboard terhadap Neon telah berhasil pada 2026-09-16; tujuh tabel aplikasi dan tiga migration terkonfirmasi. Pairing WhatsApp, satu pengiriman pilot, serta restore session setelah API restart juga berhasil: status kembali `CONNECTED` tanpa QR baru. Link-preview metadata dan payload image+caption sudah diuji tanpa mengirim pesan nyata; validasi penerimaan preview/banner pada aplikasi WhatsApp serta dispatch bertahap 5 → 10 → 25 → sekitar 100 nomor tetap wajib sebelum pilot penuh. Domain PBB kompleks tetap non-goal V1.
+Migration dan smoke test health/login/dashboard terhadap Neon telah berhasil pada 2026-09-16; tujuh tabel aplikasi dan tiga migration baseline terkonfirmasi. Migration keempat menambahkan CTA snapshot/delivery receipt dan migration kelima menambahkan idempotency campaign; keduanya bersifat aditif dan sudah diterapkan ke Neon. Pairing WhatsApp, satu pengiriman pilot, serta restore session setelah API restart juga berhasil: status kembali `CONNECTED` tanpa QR baru. Link-preview metadata, payload image+caption, dan satu native-flow CTA sudah diterima pada perangkat uji; dispatch bertahap 5 -> 10 -> 25 -> sekitar 100 nomor serta receipt lintas Android/iOS/Web tetap wajib sebelum pilot penuh. Domain PBB kompleks tetap non-goal V1.

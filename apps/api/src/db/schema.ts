@@ -30,12 +30,18 @@ export const campaigns = pgTable('campaigns', {
   status: text('status').notNull().default('DRAFT'),
   batchSize: integer('batch_size').notNull().default(10),
   useBanner: boolean('use_banner').notNull().default(false),
+  useInteractiveCta: boolean('use_interactive_cta').notNull().default(false),
+  ctaLabel: text('cta_label'),
+  ctaFooter: text('cta_footer'),
+  idempotencyKey: text('idempotency_key'),
+  requestHash: text('request_hash'),
   createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
   updatedAt: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
   startedAt: timestamp('started_at', { withTimezone: true }),
   completedAt: timestamp('completed_at', { withTimezone: true }),
 }, (table) => [
   index('campaigns_status_created_idx').on(table.status, table.createdAt),
+  uniqueIndex('campaigns_idempotency_key_uidx').on(table.idempotencyKey),
   check('campaigns_status_check', sql`${table.status} IN ('DRAFT', 'RUNNING', 'PAUSED', 'COMPLETED', 'CANCELLED')`),
   check('campaigns_batch_size_check', sql`${table.batchSize} BETWEEN 1 AND 50`),
 ])
@@ -64,6 +70,13 @@ export const messageJobs = pgTable('message_jobs', {
   processingToken: text('processing_token'),
   sentAt: timestamp('sent_at', { withTimezone: true }),
   providerMessageId: text('provider_message_id'),
+  deliveryStatus: text('delivery_status'),
+  serverAckAt: timestamp('server_ack_at', { withTimezone: true }),
+  deliveredAt: timestamp('delivered_at', { withTimezone: true }),
+  readAt: timestamp('read_at', { withTimezone: true }),
+  ctaUrl: text('cta_url'),
+  ctaLabel: text('cta_label'),
+  ctaFooter: text('cta_footer'),
   errorCode: text('error_code'),
   errorMessage: text('error_message'),
   createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
@@ -75,6 +88,7 @@ export const messageJobs = pgTable('message_jobs', {
   uniqueIndex('message_jobs_provider_message_uidx').on(table.providerMessageId),
   check('message_jobs_attempts_check', sql`${table.attempts} >= 0 AND ${table.attempts} <= ${table.maxAttempts}`),
   check('message_jobs_status_check', sql`${table.status} IN ('QUEUED', 'PROCESSING', 'SENT', 'FAILED', 'SKIPPED', 'CANCELLED')`),
+  check('message_jobs_delivery_status_check', sql`${table.deliveryStatus} IS NULL OR ${table.deliveryStatus} IN ('PENDING', 'SERVER_ACK', 'DELIVERED', 'READ', 'PLAYED', 'ERROR', 'UNKNOWN')`),
 ])
 
 export const whatsappAccounts = pgTable('whatsapp_accounts', {

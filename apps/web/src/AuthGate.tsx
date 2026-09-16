@@ -8,6 +8,7 @@ type LoginResponse = {
 
 export function AuthGate({ children }: { children: ReactNode }) {
   const [authenticated, setAuthenticated] = useState(Boolean(getAuthToken()))
+  const [checking, setChecking] = useState(Boolean(getAuthToken()))
   const [username, setUsername] = useState('admin')
   const [password, setPassword] = useState('')
   const [error, setError] = useState('')
@@ -15,8 +16,19 @@ export function AuthGate({ children }: { children: ReactNode }) {
 
   useEffect(() => {
     const handleUnauthorized = () => setAuthenticated(false)
+    const handleLogout = () => {
+      clearAuthToken()
+      setAuthenticated(false)
+    }
     window.addEventListener('wapbb:unauthorized', handleUnauthorized)
-    return () => window.removeEventListener('wapbb:unauthorized', handleUnauthorized)
+    window.addEventListener('wapbb:logout', handleLogout)
+    if (getAuthToken()) {
+      api('/api/auth/me').then(() => setAuthenticated(true)).catch(() => setAuthenticated(false)).finally(() => setChecking(false))
+    }
+    return () => {
+      window.removeEventListener('wapbb:unauthorized', handleUnauthorized)
+      window.removeEventListener('wapbb:logout', handleLogout)
+    }
   }, [])
 
   async function submit(event: FormEvent) {
@@ -29,7 +41,7 @@ export function AuthGate({ children }: { children: ReactNode }) {
         method: 'POST',
         body: JSON.stringify({ username, password }),
       })
-      setAuthToken(result.token)
+      setAuthToken(result.token, result.user.username)
       setAuthenticated(true)
       setPassword('')
     } catch (err) {
@@ -39,27 +51,16 @@ export function AuthGate({ children }: { children: ReactNode }) {
     }
   }
 
-  function logout() {
-    clearAuthToken()
-    setAuthenticated(false)
-  }
-
-  if (authenticated) {
-    return (
-      <>
-        {children}
-        <button className="logout-fab" onClick={logout}>Keluar</button>
-      </>
-    )
-  }
+  if (checking) return <main className="login-page"><div className="login-loading">Menyiapkan panel...</div></main>
+  if (authenticated) return children
 
   return (
     <main className="login-page">
       <section className="login-card">
         <div className="login-mark">W</div>
-        <p className="eyebrow">WA PBB REMINDER</p>
-        <h1>Masuk ke dashboard</h1>
-        <p className="login-subtitle">Kelola kontak, campaign, antrean, dan koneksi WhatsApp dari satu tempat.</p>
+        <p className="eyebrow">PANEL OPERASIONAL</p>
+        <h1>Masuk ke WAPBB</h1>
+        <p className="login-subtitle">Kelola penerima, campaign, antrean, dan koneksi WhatsApp secara terpusat.</p>
 
         <form onSubmit={submit}>
           <label>

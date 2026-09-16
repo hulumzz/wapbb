@@ -10,6 +10,7 @@ export type SendTextInput = {
   recipient: string
   text: string
   idempotencyKey: string
+  interactiveCta?: InteractiveCta
 }
 
 export type SendImageInput = {
@@ -17,6 +18,13 @@ export type SendImageInput = {
   imageUrl: string
   caption: string
   idempotencyKey: string
+  interactiveCta?: InteractiveCta
+}
+
+export type InteractiveCta = {
+  url: string
+  label: string
+  footer: string
 }
 
 export type SendResult = {

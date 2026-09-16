@@ -1,16 +1,7 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
 import { proto } from '@whiskeysockets/baileys'
-import { createInteractiveCtaMessage, createInteractiveCtaRelayNodes, extractInteractiveCtaUrl } from './interactive-message.js'
-
-test('mengambil URL HTTPS pertama untuk tombol CTA', () => {
-  assert.equal(
-    extractInteractiveCtaUrl('Buka informasi di https://desa.example/pbb?id=123 sekarang.'),
-    'https://desa.example/pbb?id=123',
-  )
-  assert.equal(extractInteractiveCtaUrl('Pesan biasa tanpa tautan'), undefined)
-  assert.equal(extractInteractiveCtaUrl('Alamat lokal http://localhost:3000'), undefined)
-})
+import { createInteractiveCtaMessage, createInteractiveCtaRelayNodes } from './interactive-message.js'
 
 test('membentuk native-flow CTA URL yang dapat diencode Baileys', () => {
   const message = createInteractiveCtaMessage({

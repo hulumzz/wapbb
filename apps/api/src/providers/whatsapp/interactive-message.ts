@@ -1,16 +1,4 @@
-import { extractUrlFromText, proto, type BinaryNode } from '@whiskeysockets/baileys'
-
-export function extractInteractiveCtaUrl(text: string): string | undefined {
-  const url = extractUrlFromText(text)
-  if (!url) return undefined
-
-  try {
-    const parsed = new URL(url)
-    return parsed.protocol === 'https:' ? parsed.toString() : undefined
-  } catch {
-    return undefined
-  }
-}
+import { proto, type BinaryNode } from '@whiskeysockets/baileys'
 
 type InteractiveCtaInput = {
   text: string
