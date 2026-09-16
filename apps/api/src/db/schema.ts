@@ -29,6 +29,7 @@ export const campaigns = pgTable('campaigns', {
   templateId: text('template_id').notNull().references(() => messageTemplates.id),
   status: text('status').notNull().default('DRAFT'),
   batchSize: integer('batch_size').notNull().default(10),
+  useBanner: boolean('use_banner').notNull().default(false),
   createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
   updatedAt: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
   startedAt: timestamp('started_at', { withTimezone: true }),

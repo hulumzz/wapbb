@@ -1,10 +1,11 @@
-import makeWASocket, { DisconnectReason, type ConnectionState, type WASocket } from '@whiskeysockets/baileys'
+import makeWASocket, { DisconnectReason, type AnyMessageContent, type ConnectionState, type WASocket } from '@whiskeysockets/baileys'
 import QRCode from 'qrcode'
 import { eq } from 'drizzle-orm'
 import { db } from '../../db/client.js'
 import { messageJobs, whatsappAccounts } from '../../db/schema.js'
 import { createSqlAuthState, hasStoredAuthState } from './sql-auth-state.js'
-import { MessagingProviderError, type MessagingProvider, type MessagingState, type SendTextInput, type SendResult } from './types.js'
+import { createImageMessageContent, fetchRemoteImage, RemoteImageError, type RemoteImage } from './remote-image.js'
+import { MessagingProviderError, type MessagingProvider, type MessagingState, type SendImageInput, type SendTextInput, type SendResult } from './types.js'
 import { createStableMessageId } from '../../utils/idempotency.js'
 
 const ACCOUNT_ID = 'default'
@@ -22,6 +23,7 @@ export class BaileysProvider implements MessagingProvider {
   private reconnectTimer: NodeJS.Timeout | null = null
   private reconnectAttempt = 0
   private manualDisconnect = false
+  private imageCache: { url: string; promise: Promise<RemoteImage> } | null = null
 
   async restore(): Promise<void> {
     await this.ensureAccount()
@@ -54,6 +56,9 @@ export class BaileysProvider implements MessagingProvider {
       auth: state,
       markOnlineOnConnect: false,
       syncFullHistory: false,
+      // Baileys mendeteksi URL pada pesan teks dan memakai link-preview-js.
+      // Jika metadata/thumbnail gagal dibuat, Baileys tetap mengirim teks biasa.
+      generateHighQualityLinkPreview: true,
       getMessage: async (key) => {
         if (!key.id) return undefined
         const [job] = await db.select({ renderedMessage: messageJobs.renderedMessage })
@@ -150,14 +155,38 @@ export class BaileysProvider implements MessagingProvider {
   }
 
   async sendText(input: SendTextInput): Promise<SendResult> {
+    const socket = this.requireConnectedSocket()
+    await this.validateRecipient(socket, input.recipient)
+    return this.sendContent(socket, input.recipient, input.idempotencyKey, { text: input.text })
+  }
+
+  async sendImage(input: SendImageInput): Promise<SendResult> {
+    const socket = this.requireConnectedSocket()
+    await this.validateRecipient(socket, input.recipient)
+
+    let image: RemoteImage
+    try {
+      image = await this.getRemoteImage(input.imageUrl)
+    } catch (error) {
+      if (error instanceof RemoteImageError) {
+        throw new MessagingProviderError(error.message, error.code, error.retryable)
+      }
+      throw new MessagingProviderError('Banner campaign tidak dapat disiapkan', 'BANNER_FETCH_FAILED', true)
+    }
+
+    return this.sendContent(socket, input.recipient, input.idempotencyKey, createImageMessageContent(image, input.caption))
+  }
+
+  private requireConnectedSocket(): WASocket {
     if (!this.socket || this.state.status !== 'CONNECTED') {
       throw new MessagingProviderError('WhatsApp belum terhubung', 'PROVIDER_DISCONNECTED', true)
     }
+    return this.socket
+  }
 
-    const jid = `${input.recipient}@s.whatsapp.net`
-    const messageId = createStableMessageId(input.idempotencyKey)
+  private async validateRecipient(socket: WASocket, recipient: string): Promise<void> {
     try {
-      const registrations = await this.socket.onWhatsApp(input.recipient)
+      const registrations = await socket.onWhatsApp(recipient)
       const registration = registrations?.[0]
       if (!registration?.exists) {
         throw new MessagingProviderError('Nomor tidak terdaftar di WhatsApp', 'INVALID_RECIPIENT', false)
@@ -166,9 +195,14 @@ export class BaileysProvider implements MessagingProvider {
       if (error instanceof MessagingProviderError) throw error
       throw new MessagingProviderError('Validasi nomor ke WhatsApp gagal', 'PROVIDER_LOOKUP_FAILED', true)
     }
+  }
+
+  private async sendContent(socket: WASocket, recipient: string, idempotencyKey: string, content: AnyMessageContent): Promise<SendResult> {
+    const jid = `${recipient}@s.whatsapp.net`
+    const messageId = createStableMessageId(idempotencyKey)
 
     try {
-      const result = await this.socket.sendMessage(jid, { text: input.text }, { messageId })
+      const result = await socket.sendMessage(jid, content, { messageId })
       if (!result?.key.id) {
         throw new MessagingProviderError('Provider tidak mengembalikan ID pesan', 'MISSING_MESSAGE_ID', true, true)
       }
@@ -189,6 +223,17 @@ export class BaileysProvider implements MessagingProvider {
       }
       throw new MessagingProviderError('Pengiriman WhatsApp tidak terkonfirmasi', 'DELIVERY_UNCERTAIN', true, true)
     }
+  }
+
+  private getRemoteImage(url: string): Promise<RemoteImage> {
+    if (this.imageCache?.url === url) return this.imageCache.promise
+
+    const promise = fetchRemoteImage(url).catch((error) => {
+      if (this.imageCache?.promise === promise) this.imageCache = null
+      throw error
+    })
+    this.imageCache = { url, promise }
+    return promise
   }
 
   private async ensureAccount(): Promise<void> {

@@ -13,6 +13,15 @@ export async function registerInternalRoutes(app: FastifyInstance, provider: Mes
       return reply.code(401).send({ message: 'Unauthorized' })
     }
 
+    const [campaign] = await db.select().from(campaigns)
+      .where(eq(campaigns.status, 'RUNNING'))
+      .orderBy(asc(campaigns.createdAt))
+      .limit(1)
+
+    // Scheduler tetap mendapat HTTP 200 ketika antrean memang sedang kosong,
+    // walaupun instance WhatsApp belum tersambung.
+    if (!campaign) return { processed: 0, message: 'Tidak ada campaign aktif' }
+
     const state = await provider.getStatus()
     if (state.status !== 'CONNECTED') {
       return reply.code(409).send({ message: 'WhatsApp belum terhubung', status: state.status })
@@ -37,13 +46,6 @@ export async function registerInternalRoutes(app: FastifyInstance, provider: Mes
           updated_at = NOW()
       WHERE status = 'QUEUED' AND attempts >= max_attempts
     `)
-
-    const [campaign] = await db.select().from(campaigns)
-      .where(eq(campaigns.status, 'RUNNING'))
-      .orderBy(asc(campaigns.createdAt))
-      .limit(1)
-
-    if (!campaign) return { processed: 0, message: 'Tidak ada campaign aktif' }
 
     const processingToken = randomUUID()
     const claimed = await db.transaction(async (tx) => {
@@ -88,11 +90,18 @@ export async function registerInternalRoutes(app: FastifyInstance, provider: Mes
 
     for (const [index, job] of claimed.entries()) {
       try {
-        const result = await provider.sendText({
-          recipient: job.recipient,
-          text: job.rendered_message,
-          idempotencyKey: job.id,
-        })
+        const result = campaign.useBanner
+          ? await provider.sendImage({
+              recipient: job.recipient,
+              imageUrl: config.DEFAULT_BANNER_URL,
+              caption: job.rendered_message,
+              idempotencyKey: job.id,
+            })
+          : await provider.sendText({
+              recipient: job.recipient,
+              text: job.rendered_message,
+              idempotencyKey: job.id,
+            })
         await db.update(messageJobs).set({
           status: 'SENT',
           sentAt: new Date(),

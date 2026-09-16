@@ -12,6 +12,7 @@ const createCampaign = z.object({
   templateId: z.string().uuid(),
   contactIds: z.array(z.string().uuid()).optional(),
   batchSize: z.coerce.number().int().min(1).max(50).default(config.DEFAULT_BATCH_SIZE),
+  useBanner: z.boolean().default(false),
 })
 
 type CampaignInput = z.infer<typeof createCampaign>
@@ -26,6 +27,10 @@ async function eligibleRecipients(input: Pick<CampaignInput, 'contactIds'>) {
 }
 
 export async function registerCampaignRoutes(app: FastifyInstance) {
+  app.get('/api/campaigns/settings', async () => ({
+    defaultBannerUrl: config.DEFAULT_BANNER_URL,
+  }))
+
   app.get('/api/campaigns', async () => db.select({
     ...getTableColumns(campaigns),
     recipientCount: sql<number>`(select count(*)::int from ${campaignRecipients} where ${campaignRecipients.campaignId} = ${campaigns.id})`,
@@ -64,6 +69,8 @@ export async function registerCampaignRoutes(app: FastifyInstance) {
     if (!recipients.length) return reply.code(400).send({ message: 'Tidak ada kontak eligible untuk campaign ini' })
     return {
       recipientCount: recipients.length,
+      useBanner: input.useBanner,
+      bannerUrl: input.useBanner ? config.DEFAULT_BANNER_URL : null,
       samples: recipients.slice(0, 3).map((contact) => ({
         contactId: contact.id,
         fullName: contact.fullName,
@@ -92,6 +99,7 @@ export async function registerCampaignRoutes(app: FastifyInstance) {
         name: input.name,
         templateId: template.id,
         batchSize: input.batchSize,
+        useBanner: input.useBanner,
       })
 
       await tx.insert(campaignRecipients).values(recipients.map((contact) => ({
@@ -109,7 +117,7 @@ export async function registerCampaignRoutes(app: FastifyInstance) {
       })))
     })
 
-    return reply.code(201).send({ id: campaignId, recipientCount: recipients.length, status: 'DRAFT' })
+    return reply.code(201).send({ id: campaignId, recipientCount: recipients.length, status: 'DRAFT', useBanner: input.useBanner })
   })
 
   app.post('/api/campaigns/:id/start', async (request, reply) => updateStatus(request.params, reply, 'RUNNING', ['DRAFT'], { startedAt: new Date(), completedAt: null }))

@@ -8,3 +8,4 @@ dist/
 coverage/
 apps/web/.vite/
 *.tsbuildinfo
+render-log.md

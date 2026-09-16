@@ -5,11 +5,12 @@ import { ContactImportPanel } from './ContactImportPanel'
 type Page = 'dashboard' | 'contacts' | 'campaigns' | 'templates' | 'history' | 'whatsapp'
 type Contact = { id: string; fullName: string; phone: string; phoneNormalized: string; isActive: boolean; whatsappOptIn: boolean }
 type Template = { id: string; name: string; content: string; isActive: boolean }
-type Campaign = { id: string; name: string; status: string; batchSize: number; createdAt: string; recipientCount: number; queuedCount: number; sentCount: number; failedCount: number }
+type Campaign = { id: string; name: string; status: string; batchSize: number; useBanner: boolean; createdAt: string; recipientCount: number; queuedCount: number; sentCount: number; failedCount: number }
 type Message = { id: string; recipient: string; renderedMessage: string; status: string; attempts: number; maxAttempts: number; createdAt: string; errorCode?: string | null; errorMessage?: string | null }
 type WhatsappState = { status: string; phoneNumber: string | null; qrDataUrl: string | null }
 type Dashboard = { contacts: number; activeCampaigns: number; queued: number; sent: number; failed: number; whatsapp: WhatsappState }
-type CampaignPreview = { recipientCount: number; samples: Array<{ contactId: string; fullName: string; recipient: string; renderedMessage: string }> }
+type CampaignPreview = { recipientCount: number; useBanner: boolean; bannerUrl: string | null; samples: Array<{ contactId: string; fullName: string; recipient: string; renderedMessage: string }> }
+type CampaignSettings = { defaultBannerUrl: string }
 
 const nav: Array<{ id: Page; label: string; icon: string }> = [
   { id: 'dashboard', label: 'Dashboard', icon: '⌂' },
@@ -250,12 +251,14 @@ function CampaignsPage({ notify }: { notify: (v: string) => void }) {
   const [name, setName] = useState('Reminder PBB')
   const [templateId, setTemplateId] = useState('')
   const [batchSize, setBatchSize] = useState(10)
+  const [useBanner, setUseBanner] = useState(false)
+  const [settings, setSettings] = useState<CampaignSettings | null>(null)
   const [preview, setPreview] = useState<CampaignPreview | null>(null)
   const [busy, setBusy] = useState('')
   const load = async () => {
-    const [c, t, availableContacts] = await Promise.all([api<Campaign[]>('/api/campaigns'), api<Template[]>('/api/templates'), api<Contact[]>('/api/contacts')])
+    const [c, t, availableContacts, campaignSettings] = await Promise.all([api<Campaign[]>('/api/campaigns'), api<Template[]>('/api/templates'), api<Contact[]>('/api/contacts'), api<CampaignSettings>('/api/campaigns/settings')])
     const eligible = availableContacts.filter((contact) => contact.isActive && contact.whatsappOptIn)
-    setCampaigns(c); setTemplates(t); setContacts(eligible)
+    setCampaigns(c); setTemplates(t); setContacts(eligible); setSettings(campaignSettings)
     setSelectedIds((current) => current.length ? current : eligible.map((contact) => contact.id))
     const firstActiveTemplate = t.find((template) => template.isActive)
     if (!templateId && firstActiveTemplate) setTemplateId(firstActiveTemplate.id)
@@ -266,7 +269,7 @@ function CampaignsPage({ notify }: { notify: (v: string) => void }) {
     return () => window.clearInterval(timer)
   }, [])
   const selectedTemplate = useMemo(() => templates.find((t) => t.id === templateId), [templates, templateId])
-  const payload = () => ({ name, templateId, batchSize, contactIds: selectedIds })
+  const payload = () => ({ name, templateId, batchSize, useBanner, contactIds: selectedIds })
   async function runPreview() {
     setBusy('preview')
     try { setPreview(await api<CampaignPreview>('/api/campaigns/preview', { method: 'POST', body: JSON.stringify(payload()) })) }
@@ -295,7 +298,48 @@ function CampaignsPage({ notify }: { notify: (v: string) => void }) {
     setPreview(null)
     setSelectedIds((current) => current.includes(id) ? current.filter((item) => item !== id) : [...current, id])
   }
-  return <div className="split-layout"><div className="panel grow"><div className="panel-head"><div><h2>Campaign</h2><p>Campaign dibuat sebagai queue, bukan langsung blast.</p></div><span className="live-indicator"><i /> diperbarui otomatis</span></div><div className="campaign-list">{campaigns.map((c) => { const progress = c.recipientCount ? Math.round((c.sentCount / c.recipientCount) * 100) : 0; return <article className="campaign-card" key={c.id}><div className="campaign-row"><div><strong>{c.name}</strong><p>{new Date(c.createdAt).toLocaleString('id-ID')} · batch {c.batchSize}</p></div><div className="row-actions"><span className={`badge ${['RUNNING', 'COMPLETED'].includes(c.status) ? 'success' : c.status === 'CANCELLED' ? 'danger' : ''}`}>{c.status}</span>{c.status === 'DRAFT' && <button disabled={!!busy} onClick={() => action(c.id, 'start')}>Mulai</button>}{c.status === 'RUNNING' && <button disabled={!!busy} onClick={() => action(c.id, 'pause')}>Pause</button>}{c.status === 'PAUSED' && <button disabled={!!busy} onClick={() => action(c.id, 'resume')}>Resume</button>}{['DRAFT', 'RUNNING', 'PAUSED'].includes(c.status) && <button disabled={!!busy} onClick={() => action(c.id, 'cancel')}>Batalkan</button>}</div></div><div className="campaign-progress"><div><span style={{ width: `${progress}%` }} /></div><p><strong>{c.sentCount}/{c.recipientCount}</strong> terkirim <span>{c.queuedCount} antre · {c.failedCount} gagal</span></p></div></article> })}{!campaigns.length && <div className="table-empty">Belum ada campaign.</div>}</div></div><form className="panel side-form wide" onSubmit={create}><p className="eyebrow">CAMPAIGN BARU</p><h2>Siapkan antrean</h2><label>Nama campaign<input value={name} onChange={(e) => { setName(e.target.value); setPreview(null) }} /></label><label>Template<select required value={templateId} onChange={(e) => { setTemplateId(e.target.value); setPreview(null) }}><option value="">Pilih template</option>{templates.filter((t) => t.isActive).map((t) => <option key={t.id} value={t.id}>{t.name}</option>)}</select></label><label>Ukuran batch<input type="number" min={1} max={50} value={batchSize} onChange={(e) => { setBatchSize(Number(e.target.value)); setPreview(null) }} /></label><fieldset className="recipient-picker"><legend>Penerima ({selectedIds.length}/{contacts.length})</legend><div className="recipient-tools"><button type="button" onClick={() => { setSelectedIds(contacts.map((contact) => contact.id)); setPreview(null) }}>Pilih semua</button><button type="button" onClick={() => { setSelectedIds([]); setPreview(null) }}>Kosongkan</button></div><div>{contacts.map((contact) => <label className="checkbox-row" key={contact.id}><input type="checkbox" checked={selectedIds.includes(contact.id)} onChange={() => toggleContact(contact.id)} /><span>{contact.fullName}<small>{contact.phoneNormalized}</small></span></label>)}</div></fieldset>{preview ? <div className="preview"><small>Preview final · {preview.recipientCount} penerima</small>{preview.samples.map((sample) => <p key={sample.contactId}><strong>{sample.fullName}</strong><br />{sample.renderedMessage}</p>)}</div> : <div className="preview"><small>Preview template</small><p>{selectedTemplate?.content.replace(/{{\s*nama\s*}}/gi, 'Ahmad Fauzi') ?? 'Pilih template terlebih dahulu.'}</p></div>}<button type="button" onClick={runPreview} disabled={!!busy || !templateId || !selectedIds.length}>{busy === 'preview' ? 'Menyiapkan preview…' : 'Tinjau campaign'}</button><button className="primary" disabled={!!busy || !preview}>{busy === 'create' ? 'Membuat antrean…' : preview ? 'Konfirmasi & buat draft' : 'Tinjau dahulu'}</button></form></div>
+  return <div className="split-layout">
+    <div className="panel grow">
+      <div className="panel-head"><div><h2>Campaign</h2><p>Campaign dibuat sebagai queue, bukan langsung blast.</p></div><span className="live-indicator"><i /> diperbarui otomatis</span></div>
+      <div className="campaign-list">
+        {campaigns.map((campaign) => {
+          const progress = campaign.recipientCount ? Math.round((campaign.sentCount / campaign.recipientCount) * 100) : 0
+          return <article className="campaign-card" key={campaign.id}>
+            <div className="campaign-row">
+              <div><strong>{campaign.name}</strong><p>{new Date(campaign.createdAt).toLocaleString('id-ID')} · batch {campaign.batchSize} · {campaign.useBanner ? 'banner' : 'text-only'}</p></div>
+              <div className="row-actions">
+                <span className={`badge ${['RUNNING', 'COMPLETED'].includes(campaign.status) ? 'success' : campaign.status === 'CANCELLED' ? 'danger' : ''}`}>{campaign.status}</span>
+                {campaign.status === 'DRAFT' && <button disabled={!!busy} onClick={() => action(campaign.id, 'start')}>Mulai</button>}
+                {campaign.status === 'RUNNING' && <button disabled={!!busy} onClick={() => action(campaign.id, 'pause')}>Pause</button>}
+                {campaign.status === 'PAUSED' && <button disabled={!!busy} onClick={() => action(campaign.id, 'resume')}>Resume</button>}
+                {['DRAFT', 'RUNNING', 'PAUSED'].includes(campaign.status) && <button disabled={!!busy} onClick={() => action(campaign.id, 'cancel')}>Batalkan</button>}
+              </div>
+            </div>
+            <div className="campaign-progress"><div><span style={{ width: `${progress}%` }} /></div><p><strong>{campaign.sentCount}/{campaign.recipientCount}</strong> terkirim <span>{campaign.queuedCount} antre · {campaign.failedCount} gagal</span></p></div>
+          </article>
+        })}
+        {!campaigns.length && <div className="table-empty">Belum ada campaign.</div>}
+      </div>
+    </div>
+    <form className="panel side-form wide" onSubmit={create}>
+      <p className="eyebrow">CAMPAIGN BARU</p><h2>Siapkan antrean</h2>
+      <label>Nama campaign<input value={name} onChange={(event) => { setName(event.target.value); setPreview(null) }} /></label>
+      <label>Template<select required value={templateId} onChange={(event) => { setTemplateId(event.target.value); setPreview(null) }}><option value="">Pilih template</option>{templates.filter((template) => template.isActive).map((template) => <option key={template.id} value={template.id}>{template.name}</option>)}</select></label>
+      <label>Ukuran batch<input type="number" min={1} max={50} value={batchSize} onChange={(event) => { setBatchSize(Number(event.target.value)); setPreview(null) }} /></label>
+      <label className="checkbox-row banner-option"><input type="checkbox" checked={useBanner} onChange={(event) => { setUseBanner(event.target.checked); setPreview(null) }} /><span>Gunakan banner PBB<small>Gambar dikirim sebagai media dengan template sebagai caption.</small></span></label>
+      {useBanner && settings?.defaultBannerUrl && <div className="banner-preview"><img src={settings.defaultBannerUrl} alt="Preview banner PBB" /><span>Banner default campaign</span></div>}
+      <fieldset className="recipient-picker">
+        <legend>Penerima ({selectedIds.length}/{contacts.length})</legend>
+        <div className="recipient-tools"><button type="button" onClick={() => { setSelectedIds(contacts.map((contact) => contact.id)); setPreview(null) }}>Pilih semua</button><button type="button" onClick={() => { setSelectedIds([]); setPreview(null) }}>Kosongkan</button></div>
+        <div>{contacts.map((contact) => <label className="checkbox-row" key={contact.id}><input type="checkbox" checked={selectedIds.includes(contact.id)} onChange={() => toggleContact(contact.id)} /><span>{contact.fullName}<small>{contact.phoneNormalized}</small></span></label>)}</div>
+      </fieldset>
+      {preview
+        ? <div className="preview">{preview.useBanner && preview.bannerUrl && <img className="message-banner-preview" src={preview.bannerUrl} alt="Banner yang akan dikirim" />}<small>Preview final · {preview.recipientCount} penerima</small>{preview.samples.map((sample) => <p key={sample.contactId}><strong>{sample.fullName}</strong><br />{sample.renderedMessage}</p>)}</div>
+        : <div className="preview">{useBanner && settings?.defaultBannerUrl && <img className="message-banner-preview" src={settings.defaultBannerUrl} alt="Banner yang akan dikirim" />}<small>Preview template</small><p>{selectedTemplate?.content.replace(/{{\s*nama\s*}}/gi, 'Ahmad Fauzi') ?? 'Pilih template terlebih dahulu.'}</p></div>}
+      <button type="button" onClick={runPreview} disabled={!!busy || !templateId || !selectedIds.length}>{busy === 'preview' ? 'Menyiapkan preview…' : 'Tinjau campaign'}</button>
+      <button className="primary" disabled={!!busy || !preview}>{busy === 'create' ? 'Membuat antrean…' : preview ? 'Konfirmasi & buat draft' : 'Tinjau dahulu'}</button>
+    </form>
+  </div>
 }
 
 function HistoryPage({ notify }: { notify: (v: string) => void }) {

@@ -1,0 +1,1 @@
+ALTER TABLE "campaigns" ADD COLUMN "use_banner" boolean DEFAULT false NOT NULL;

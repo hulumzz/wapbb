@@ -12,6 +12,13 @@ export type SendTextInput = {
   idempotencyKey: string
 }
 
+export type SendImageInput = {
+  recipient: string
+  imageUrl: string
+  caption: string
+  idempotencyKey: string
+}
+
 export type SendResult = {
   providerMessageId: string
 }
@@ -33,4 +40,5 @@ export interface MessagingProvider {
   disconnect(): Promise<void>
   getStatus(): Promise<MessagingState>
   sendText(input: SendTextInput): Promise<SendResult>
+  sendImage(input: SendImageInput): Promise<SendResult>
 }

@@ -23,6 +23,7 @@ Aplikasi standalone ringan untuk mengelola kontak dan antrean reminder WhatsApp.
    - `AUTH_SECRET`
    - `INTERNAL_DISPATCH_SECRET`
    - `WA_SESSION_ENCRYPTION_KEY`
+   - `DEFAULT_BANNER_URL` (opsional; sudah memiliki default banner PBB)
 4. Install dependency:
 
 ```bash
@@ -107,6 +108,8 @@ Setiap job memakai message ID provider yang stabil dari ID job. Error sementara 
 
 Default batch saat ini adalah 10, tetapi dapat diubah per campaign. Batch digunakan untuk kontrol operasional dan resource, bukan sebagai jaminan untuk menghindari sistem anti-spam WhatsApp.
 
+Campaign dapat berjalan sebagai text-only atau menggunakan banner. Banner diambil dari `DEFAULT_BANNER_URL` saat dispatch, tidak disimpan ke database/filesystem, dan dikirim sebagai media image dengan snapshot template sebagai caption. Pesan text-only yang memuat URL memakai link preview Baileys; kegagalan membuat preview tidak membatalkan pengiriman teks.
+
 Workflow contoh tersedia di `.github/workflows/dispatcher.yml`. Tambahkan repository secrets:
 
 - `DISPATCH_URL`, contoh `https://service.example.com/internal/dispatch`
@@ -127,6 +130,7 @@ Saat membuat Blueprint di Render, isi environment yang masih `sync: false`:
 - `WEB_ORIGIN` — URL frontend production
 - `ADMIN_USERNAME`
 - `ADMIN_PASSWORD`
+- `DEFAULT_BANNER_URL` — opsional bila ingin mengganti banner bawaan
 
 `AUTH_SECRET`, `INTERNAL_DISPATCH_SECRET`, dan `WA_SESSION_ENCRYPTION_KEY` disiapkan untuk digenerate oleh Render. Simpan nilai `INTERNAL_DISPATCH_SECRET` jika scheduler eksternal akan digunakan.
 
@@ -154,6 +158,7 @@ Sudah tersedia sebagai fondasi:
 - encrypted PostgreSQL-backed Baileys auth state
 - restore session + reconnect exponential backoff
 - preview server-side dan pemilihan penerima campaign
+- link preview WhatsApp dan opsi campaign image + caption menggunakan banner statis
 - retry/backoff, circuit breaker, stale-job recovery konservatif, dan retry manual
 - migration SQL versioned serta startup migration di Render
 - Render Blueprint

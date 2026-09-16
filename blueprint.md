@@ -101,6 +101,7 @@ interface MessagingProvider {
   disconnect(): Promise<void>
   getStatus(): Promise<MessagingStatus>
   sendText(input: SendTextInput): Promise<SendResult>
+  sendImage(input: SendImageInput): Promise<SendResult>
 }
 ```
 
@@ -226,6 +227,7 @@ name
 template_id
 status
 batch_size
+use_banner
 created_at
 updated_at
 started_at
@@ -413,7 +415,7 @@ Ambil maksimal batch_size job eligible
         ↓
 PROCESSING
         ↓
-Provider.sendText()
+Provider.sendText() / Provider.sendImage()
         ↓
 SENT / FAILED
 ```
@@ -681,6 +683,7 @@ V1 dianggap siap pilot ketika:
 - restart/redeploy tidak mengharuskan QR ulang selama session masih valid.
 - status WhatsApp terlihat dari UI.
 - failed job tercatat dan dapat dianalisis.
+- ketika tidak ada campaign RUNNING, dispatcher mengembalikan sukses/no-op walaupun WhatsApp sedang disconnected.
 - blueprint ini masih berada di repository dan diperbarui bila keputusan arsitektur berubah.
 
 ## 20. Aturan untuk agent/developer berikutnya
@@ -710,5 +713,8 @@ Messaging engine V1 kini menggunakan keputusan operasional berikut:
 - Job `PROCESSING` yang melewati timeout tidak otomatis diulang karena hasil kirim dapat tidak pasti. Job dipindah ke `FAILED` dengan `DELIVERY_UNKNOWN_AFTER_RESTART`; retry harus dipicu admin dari halaman Riwayat. Ini adalah kompromi V1 untuk memprioritaskan duplicate-send prevention.
 - API admin dilindungi JWT dan rate limit; login dibatasi lebih ketat. `/internal/dispatch` memakai bearer secret dengan constant-time comparison. `/health` memeriksa koneksi database.
 - Vite hanya membaca file environment di `apps/web`; `.env` root dikhususkan untuk backend agar `NODE_ENV` dan secret backend tidak memengaruhi atau ikut diproses build frontend.
+- Pesan teks memakai generator link preview bawaan Baileys dengan `link-preview-js` 3.x dan high-quality preview diaktifkan. Kegagalan metadata/thumbnail tidak menggagalkan pengiriman teks.
+- Campaign memiliki flag `use_banner`. Jika aktif, API mengambil `DEFAULT_BANNER_URL` ke buffer memory sementara (timeout 15 detik, maksimal 5 MB), lalu Baileys mengirim image dengan snapshot pesan sebagai caption. File/base64 banner tidak disimpan ke database atau filesystem; kegagalan sumber media dicatat pada message job dan mengikuti aturan retry yang sama.
+- Dispatcher melakukan pengecekan campaign RUNNING sebelum status provider. Panggilan scheduler saat antrean campaign kosong menjadi no-op HTTP 200 sehingga tidak dilaporkan sebagai kegagalan hanya karena WhatsApp sedang disconnected.
 
-Migration dan smoke test health/login/dashboard terhadap Neon telah berhasil pada 2026-09-16; tujuh tabel aplikasi dan dua migration terkonfirmasi. Pairing WhatsApp, satu pengiriman pilot, serta restore session setelah API restart juga berhasil: status kembali `CONNECTED` tanpa QR baru. Validasi yang masih wajib sebelum pilot penuh adalah dispatch bertahap 5 → 10 → 25 → sekitar 100 nomor. Domain PBB kompleks tetap non-goal V1.
+Migration dan smoke test health/login/dashboard terhadap Neon telah berhasil pada 2026-09-16; tujuh tabel aplikasi dan tiga migration terkonfirmasi. Pairing WhatsApp, satu pengiriman pilot, serta restore session setelah API restart juga berhasil: status kembali `CONNECTED` tanpa QR baru. Link-preview metadata dan payload image+caption sudah diuji tanpa mengirim pesan nyata; validasi penerimaan preview/banner pada aplikasi WhatsApp serta dispatch bertahap 5 → 10 → 25 → sekitar 100 nomor tetap wajib sebelum pilot penuh. Domain PBB kompleks tetap non-goal V1.

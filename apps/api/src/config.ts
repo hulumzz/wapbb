@@ -35,6 +35,10 @@ const envSchema = z.object({
   DEFAULT_BATCH_SIZE: z.coerce.number().int().min(1).max(50).default(10),
   PROCESSING_TIMEOUT_MINUTES: z.coerce.number().int().min(5).max(1440).default(15),
   RETRY_DELAY_SECONDS: z.coerce.number().int().min(5).max(3600).default(60),
+  DEFAULT_BANNER_URL: z.string().url().refine(
+    (value) => value.startsWith('https://'),
+    'DEFAULT_BANNER_URL harus menggunakan HTTPS',
+  ).default('https://i.ibb.co.com/fVFQc0HD/Chat-GPT-Image-16-Sep-2026-11-08-14-1-2.png'),
 })
 
 export const config = envSchema.parse(process.env)

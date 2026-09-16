@@ -27,6 +27,8 @@ services:
         generateValue: true
       - key: DEFAULT_BATCH_SIZE
         value: "10"
+      - key: DEFAULT_BANNER_URL
+        value: https://i.ibb.co.com/fVFQc0HD/Chat-GPT-Image-16-Sep-2026-11-08-14-1-2.png
 
   - type: web
     name: wapbb-web
