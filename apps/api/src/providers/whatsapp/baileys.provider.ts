@@ -1,9 +1,14 @@
-import makeWASocket, { DisconnectReason, prepareWAMessageMedia, type AnyMessageContent, type ConnectionState, type WAMessageUpdate, type WASocket } from '@whiskeysockets/baileys'
+import { randomUUID } from 'node:crypto'
+import makeWASocket, { DisconnectReason, generateWAMessage, prepareWAMessageMedia, type AnyMessageContent, type ConnectionState, type WAMessageUpdate, type WASocket, type WAMessageContent } from '@whiskeysockets/baileys'
 import QRCode from 'qrcode'
 import { and, eq, inArray, isNull, or, sql } from 'drizzle-orm'
 import { db } from '../../db/client.js'
-import { messageJobs, whatsappAccounts } from '../../db/schema.js'
-import { createSqlAuthState, hasStoredAuthState } from './sql-auth-state.js'
+import { messageAttempts, messageJobs, whatsappAccounts } from '../../db/schema.js'
+import { acquireLease, releaseLease } from '../../utils/lease.js'
+import { decryptPayload, encryptPayload } from '../../utils/encrypted-payload.js'
+import { stripMediaBytes } from './outbound-metadata.js'
+import { generateSafeLinkPreview } from './safe-link-preview.js'
+import { clearStoredAuthState, createSqlAuthState, hasStoredAuthState } from './sql-auth-state.js'
 import { createImageMessageContent, fetchRemoteImage, RemoteImageError, type RemoteImage } from './remote-image.js'
 import { createInteractiveCtaMessage, createInteractiveCtaRelayNodes } from './interactive-message.js'
 import { allowedPreviousDeliveryStatuses, confirmsSubmission, mapBaileysDeliveryStatus, type DeliveryStatus } from './delivery-status.js'
@@ -26,10 +31,22 @@ export class BaileysProvider implements MessagingProvider {
   private reconnectAttempt = 0
   private manualDisconnect = false
   private imageCache: { url: string; promise: Promise<RemoteImage> } | null = null
+  private readonly owner = randomUUID()
+  private leaseTimer: NodeJS.Timeout | null = null
+  private flushAuth: (() => Promise<void>) | null = null
+  private authCleanup: Promise<void> = Promise.resolve()
+  private authPersistence: 'healthy' | 'degraded' = 'healthy'
+  private reason: string | null = null
+  private changedAt = new Date().toISOString()
 
   async restore(): Promise<void> {
-    await this.ensureAccount()
-    if (await hasStoredAuthState(ACCOUNT_ID)) await this.connect()
+    try { await this.ensureAccount(); if (await hasStoredAuthState(ACCOUNT_ID)) await this.connect() }
+    catch (error) {
+      const invalid = (error as { code?: string }).code === 'AUTH_STATE_INVALID'
+      this.reason = invalid ? 'AUTH_STATE_INVALID' : 'RESTORE_FAILED'
+      this.state.status = invalid ? 'NEEDS_REAUTH' : 'DISCONNECTED'
+      if (!invalid) this.scheduleReconnect()
+    }
   }
 
   async connect(): Promise<void> {
@@ -42,18 +59,61 @@ export class BaileysProvider implements MessagingProvider {
       this.reconnectTimer = null
     }
 
-    this.connecting = this.openSocket().finally(() => {
+    this.connecting = this.openSocket().catch(async (error) => {
+      this.socket?.end(undefined)
+      this.socket = null
+      const invalid = (error as { code?: string }).code === 'AUTH_STATE_INVALID'
+      this.state.status = invalid ? 'NEEDS_REAUTH' : 'DISCONNECTED'
+      this.reason = invalid ? 'AUTH_STATE_INVALID' : 'CONNECTION_SETUP_FAILED'
+      this.changedAt = new Date().toISOString()
+      if (!invalid) this.scheduleReconnect()
+    }).finally(() => {
       this.connecting = null
     })
     return this.connecting
   }
 
   private async openSocket(): Promise<void> {
+    await this.authCleanup
+    const resetInvalidAuth = this.state.status === 'NEEDS_REAUTH'
     await this.ensureAccount()
+    let ownsLease = false
+    try { ownsLease = await acquireLease('whatsapp:default', this.owner) } catch { /* Cannot renew means fail closed. */ }
+    if (!ownsLease) {
+      this.reason = 'SESSION_IN_USE'
+      this.scheduleReconnect()
+      return
+    }
+    if (!this.leaseTimer) {
+      this.leaseTimer = setInterval(() => {
+        if (this.manualDisconnect) return
+        void acquireLease('whatsapp:default', this.owner).then((owned) => {
+          if (this.manualDisconnect) return
+          if (!owned) throw new Error('Lease lost')
+        }).catch(() => {
+          this.reason = 'SESSION_LEASE_LOST'
+          this.socket?.end(undefined)
+          this.socket = null
+          this.state.status = 'DISCONNECTED'
+          this.scheduleReconnect()
+        })
+      }, 30_000)
+      this.leaseTimer.unref()
+    }
+    this.reason = null
+    this.changedAt = new Date().toISOString()
     this.state = { ...this.state, status: 'CONNECTING', qrDataUrl: null }
     await this.persistStatus('CONNECTING')
 
-    const { state, saveCreds, clear } = await createSqlAuthState(ACCOUNT_ID)
+    if (resetInvalidAuth) await clearStoredAuthState(ACCOUNT_ID)
+    const { state, saveCreds, clear, flush } = await createSqlAuthState(ACCOUNT_ID, this.owner)
+    this.authPersistence = 'healthy'
+    const setKeys = state.keys.set.bind(state.keys)
+    state.keys.set = async (keys) => {
+      try { await setKeys(keys) }
+      catch (error) { this.authPersistence = 'degraded'; this.reason = 'AUTH_PERSISTENCE_FAILED'; this.socket?.end(undefined); throw error }
+    }
+    this.flushAuth = flush
     const socket = makeWASocket({
       auth: state,
       markOnlineOnConnect: false,
@@ -63,16 +123,22 @@ export class BaileysProvider implements MessagingProvider {
       generateHighQualityLinkPreview: true,
       getMessage: async (key) => {
         if (!key.id) return undefined
-        const [job] = await db.select({ renderedMessage: messageJobs.renderedMessage })
-          .from(messageJobs)
-          .where(eq(messageJobs.providerMessageId, key.id))
+        const [attempt] = await db.select({ payload: messageAttempts.outboundCiphertext })
+          .from(messageAttempts)
+          .where(eq(messageAttempts.providerMessageId, key.id))
           .limit(1)
-        return job ? { conversation: job.renderedMessage } : undefined
+        return attempt?.payload ? decryptPayload<WAMessageContent>(attempt.payload, `outbound:${key.id}`) : undefined
       },
     })
     this.socket = socket
 
-    socket.ev.on('creds.update', saveCreds)
+    socket.ev.on('creds.update', () => {
+      void saveCreds().catch(() => {
+        this.authPersistence = 'degraded'
+        this.reason = 'AUTH_PERSISTENCE_FAILED'
+        socket.end(undefined)
+      })
+    })
     socket.ev.on('messages.update', (updates) => {
       void this.handleMessageUpdates(updates).catch((error) => {
         console.error('Gagal menyimpan acknowledgement WhatsApp', error instanceof Error ? error.message : 'unknown error')
@@ -94,12 +160,15 @@ export class BaileysProvider implements MessagingProvider {
 
     if (update.qr) {
       const qrDataUrl = await QRCode.toDataURL(update.qr, { margin: 1, width: 320 })
+      if (this.socket !== socket) return
       this.state = { ...this.state, status: 'QR_READY', qrDataUrl }
       await this.persistStatus('QR_READY')
     }
 
     if (update.connection === 'open') {
       this.reconnectAttempt = 0
+      this.reason = null
+      this.changedAt = new Date().toISOString()
       const phoneNumber = socket.user?.id?.split(':')[0]?.split('@')[0] ?? null
       this.state = { status: 'CONNECTED', phoneNumber, qrDataUrl: null }
       await db.update(whatsappAccounts).set({
@@ -117,21 +186,24 @@ export class BaileysProvider implements MessagingProvider {
         || statusCode === DisconnectReason.badSession
         || statusCode === DisconnectReason.multideviceMismatch
       const replaced = statusCode === DisconnectReason.connectionReplaced
+      this.reason = needsFreshSession ? 'SESSION_INVALID' : replaced ? 'CONNECTION_REPLACED' : 'CONNECTION_CLOSED'
+      this.changedAt = new Date().toISOString()
+      this.authCleanup = (needsFreshSession ? clearAuth() : this.flushAuth?.() ?? Promise.resolve()).catch(() => { this.authPersistence = 'degraded' })
       this.socket = null
       this.state = {
         status: needsFreshSession ? 'NEEDS_REAUTH' : 'DISCONNECTED',
         phoneNumber: this.state.phoneNumber,
         qrDataUrl: null,
       }
-      if (needsFreshSession) await clearAuth()
+      await this.authCleanup
       await this.persistStatus(this.state.status)
 
-      if (!needsFreshSession && !replaced && !this.manualDisconnect) this.scheduleReconnect()
+      if (!needsFreshSession && !this.manualDisconnect) this.scheduleReconnect()
     }
   }
 
   private scheduleReconnect() {
-    if (this.reconnectTimer) return
+    if (this.reconnectTimer || this.manualDisconnect) return
     const delay = Math.min(RECONNECT_DELAY_MS * (2 ** this.reconnectAttempt), MAX_RECONNECT_DELAY_MS)
     this.reconnectAttempt += 1
     this.reconnectTimer = setTimeout(() => {
@@ -155,22 +227,35 @@ export class BaileysProvider implements MessagingProvider {
     this.socket?.end(undefined)
     this.socket = null
     this.state = { ...this.state, status: 'DISCONNECTED', qrDataUrl: null }
+    if (this.leaseTimer) clearInterval(this.leaseTimer)
+    this.leaseTimer = null
+    let timeout: NodeJS.Timeout | undefined
+    let drained = false
+    try {
+      await Promise.race([(this.flushAuth?.() ?? Promise.resolve()).then(() => { drained = true }), new Promise<void>((resolve) => { timeout = setTimeout(resolve, 10_000) })])
+    } catch { this.authPersistence = 'degraded' }
+    finally { if (timeout) clearTimeout(timeout) }
+    if (drained) await releaseLease('whatsapp:default', this.owner).catch(() => undefined)
   }
 
   async getStatus(): Promise<MessagingState> {
-    return this.state
+    return { ...this.state, reason: this.reason, changedAt: this.changedAt, authPersistence: this.authPersistence }
   }
 
   async sendText(input: SendTextInput): Promise<SendResult> {
-    const socket = this.requireConnectedSocket()
-    await this.validateRecipient(socket, input.recipient)
-    if (input.interactiveCta) {
-      return this.sendInteractiveCta(socket, input.recipient, input.idempotencyKey, input.text, input.interactiveCta)
-    }
-    return this.sendContent(socket, input.recipient, input.idempotencyKey, { text: input.text })
+    return this.withDeadline(input.deadline, async () => {
+      const socket = this.requireConnectedSocket()
+      await this.validateRecipient(socket, input.recipient)
+      if (input.interactiveCta) return this.sendInteractiveCta(socket, input.recipient, input.idempotencyKey, input.text, input.interactiveCta, undefined, input.beforeRelay)
+      return this.sendContent(socket, input.recipient, input.idempotencyKey, { text: input.text }, input.beforeRelay)
+    })
   }
 
   async sendImage(input: SendImageInput): Promise<SendResult> {
+    return this.withDeadline(input.deadline, () => this.sendImagePrepared(input))
+  }
+
+  private async sendImagePrepared(input: SendImageInput): Promise<SendResult> {
     const socket = this.requireConnectedSocket()
     await this.validateRecipient(socket, input.recipient)
 
@@ -185,13 +270,13 @@ export class BaileysProvider implements MessagingProvider {
     }
 
     if (input.interactiveCta) {
-      return this.sendInteractiveCta(socket, input.recipient, input.idempotencyKey, input.caption, input.interactiveCta, image)
+      return this.sendInteractiveCta(socket, input.recipient, input.idempotencyKey, input.caption, input.interactiveCta, image, input.beforeRelay)
     }
-    return this.sendContent(socket, input.recipient, input.idempotencyKey, createImageMessageContent(image, input.caption))
+    return this.sendContent(socket, input.recipient, input.idempotencyKey, createImageMessageContent(image, input.caption), input.beforeRelay)
   }
 
   private requireConnectedSocket(): WASocket {
-    if (!this.socket || this.state.status !== 'CONNECTED') {
+    if (!this.socket || this.state.status !== 'CONNECTED' || this.authPersistence !== 'healthy') {
       throw new MessagingProviderError('WhatsApp belum terhubung', 'PROVIDER_DISCONNECTED', true)
     }
     return this.socket
@@ -210,16 +295,17 @@ export class BaileysProvider implements MessagingProvider {
     }
   }
 
-  private async sendContent(socket: WASocket, recipient: string, idempotencyKey: string, content: AnyMessageContent): Promise<SendResult> {
+  private async sendContent(socket: WASocket, recipient: string, idempotencyKey: string, content: AnyMessageContent, beforeRelay?: () => Promise<void>): Promise<SendResult> {
     const jid = `${recipient}@s.whatsapp.net`
     const messageId = createStableMessageId(idempotencyKey)
 
     try {
-      const result = await socket.sendMessage(jid, content, { messageId })
-      if (!result?.key.id) {
-        throw new MessagingProviderError('Provider tidak mengembalikan ID pesan', 'MISSING_MESSAGE_ID', true, true)
-      }
-      return { providerMessageId: result.key.id }
+      const result = await generateWAMessage(jid, content, {
+        userJid: socket.user!.id, messageId, upload: socket.waUploadToServer, mediaUploadTimeoutMs: 10_000,
+        getUrlInfo: (text) => generateSafeLinkPreview(text, socket.waUploadToServer),
+      })
+      if (!result.message) throw new MessagingProviderError('Pesan tidak dapat disiapkan', 'PREPARATION_FAILED', true)
+      return this.relayPrepared(socket, jid, messageId, result.message, false, beforeRelay)
     } catch (error) {
       throw this.mapSendError(error)
     }
@@ -232,6 +318,7 @@ export class BaileysProvider implements MessagingProvider {
     text: string,
     interactiveCta: InteractiveCta,
     image?: RemoteImage,
+    beforeRelay?: () => Promise<void>,
   ): Promise<SendResult> {
     let imageMessage
     if (image) {
@@ -262,14 +349,7 @@ export class BaileysProvider implements MessagingProvider {
     })
 
     try {
-      const providerMessageId = await socket.relayMessage(jid, content, {
-        messageId,
-        additionalNodes: createInteractiveCtaRelayNodes(),
-      })
-      if (!providerMessageId) {
-        throw new MessagingProviderError('Provider tidak mengembalikan ID pesan interaktif', 'MISSING_MESSAGE_ID', true, true)
-      }
-      return { providerMessageId }
+      return await this.relayPrepared(socket, jid, messageId, content, true, beforeRelay)
     } catch (error) {
       throw this.mapSendError(error)
     }
@@ -277,12 +357,13 @@ export class BaileysProvider implements MessagingProvider {
 
   private mapSendError(error: unknown): MessagingProviderError {
     if (error instanceof MessagingProviderError) return error
+    if (!this.relayStarted) return new MessagingProviderError('Persiapan pesan gagal sebelum relay', 'PREPARATION_FAILED', true)
     const statusCode = (error as { output?: { statusCode?: number } } | undefined)?.output?.statusCode
     if (statusCode === 400 || statusCode === 404) {
       return new MessagingProviderError('Nomor WhatsApp ditolak provider', 'INVALID_RECIPIENT', false)
     }
     if (statusCode === DisconnectReason.loggedOut || statusCode === DisconnectReason.forbidden) {
-      return new MessagingProviderError('Session WhatsApp tidak lagi valid', 'PROVIDER_DISCONNECTED', true)
+      return new MessagingProviderError('Session WhatsApp tidak lagi valid', 'PROVIDER_DISCONNECTED', false, true)
     }
     if (statusCode === DisconnectReason.connectionClosed
       || statusCode === DisconnectReason.connectionLost
@@ -290,6 +371,44 @@ export class BaileysProvider implements MessagingProvider {
       return new MessagingProviderError('Koneksi WhatsApp terputus saat pengiriman', 'PROVIDER_DISCONNECTED', true, true)
     }
     return new MessagingProviderError('Pengiriman WhatsApp tidak terkonfirmasi', 'DELIVERY_UNCERTAIN', true, true)
+  }
+
+  private deadline = 0
+  private relayStarted = false
+  private async withDeadline(deadline: number | undefined, operation: () => Promise<SendResult>): Promise<SendResult> {
+    this.deadline = deadline ?? Date.now() + 20_000
+    this.relayStarted = false
+    let timer: NodeJS.Timeout | undefined
+    try {
+      return await Promise.race([operation(), new Promise<never>((_, reject) => {
+        timer = setTimeout(() => {
+          this.deadline = 0
+          this.socket?.end(undefined)
+          this.socket = null
+          this.state.status = 'DISCONNECTED'
+          this.scheduleReconnect()
+          reject(new MessagingProviderError('Batas waktu pengiriman tercapai', 'SEND_TIMEOUT', !this.relayStarted, this.relayStarted))
+        }, Math.max(1, this.deadline - Date.now()))
+      })])
+    } finally { if (timer) clearTimeout(timer) }
+  }
+
+  private async relayPrepared(socket: WASocket, jid: string, messageId: string, content: WAMessageContent, cta: boolean, beforeRelay?: () => Promise<void>): Promise<SendResult> {
+    const guard = () => {
+      if (Date.now() >= this.deadline || this.socket !== socket || this.state.status !== 'CONNECTED') throw new MessagingProviderError('Pengiriman dihentikan sebelum relay', 'PREPARATION_INTERRUPTED', true)
+    }
+    guard()
+    if (!await acquireLease('whatsapp:default', this.owner)) {
+      this.reason = 'SESSION_LEASE_LOST'; socket.end(undefined); this.socket = null; this.state.status = 'DISCONNECTED'; this.scheduleReconnect()
+      throw new MessagingProviderError('Kepemilikan session hilang', 'PROVIDER_DISCONNECTED', true)
+    }
+    await beforeRelay?.()
+    await db.update(messageAttempts).set({ outboundCiphertext: encryptPayload(stripMediaBytes(content), `outbound:${messageId}`) }).where(eq(messageAttempts.providerMessageId, messageId))
+    guard()
+    this.relayStarted = true
+    const providerMessageId = await socket.relayMessage(jid, content, { messageId, ...(cta ? { additionalNodes: createInteractiveCtaRelayNodes() } : {}) })
+    if (!providerMessageId) throw new MessagingProviderError('Provider tidak memberikan ID pesan', 'MISSING_MESSAGE_ID', false, true)
+    return { providerMessageId }
   }
 
   private getRemoteImage(url: string): Promise<RemoteImage> {
@@ -314,6 +433,7 @@ export class BaileysProvider implements MessagingProvider {
         ? or(isNull(messageJobs.deliveryStatus), inArray(messageJobs.deliveryStatus, previousStatuses))
         : isNull(messageJobs.deliveryStatus)
       const now = new Date()
+      await db.update(messageAttempts).set({ deliveryStatus, updatedAt: now }).where(and(eq(messageAttempts.providerMessageId, providerMessageId), previousStatuses.length ? or(isNull(messageAttempts.deliveryStatus), inArray(messageAttempts.deliveryStatus, previousStatuses)) : isNull(messageAttempts.deliveryStatus)))
       const timestamps = this.deliveryTimestamps(deliveryStatus, now)
       const queueUpdate = confirmsSubmission(deliveryStatus)
         ? {

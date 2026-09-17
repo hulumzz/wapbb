@@ -47,6 +47,7 @@ type Dashboard = {
   whatsapp: WhatsappState
 }
 type CampaignPreview = {
+  previewToken: string
   recipientCount: number
   useBanner: boolean
   useInteractiveCta: boolean
@@ -287,7 +288,7 @@ function CampaignsPage({ notify }: { notify: Notify }) {
     const [campaignData, templateData, contactData, campaignSettings] = await Promise.all([api<Campaign[]>('/api/campaigns'), api<Template[]>('/api/templates'), api<Contact[]>('/api/contacts'), api<CampaignSettings>('/api/campaigns/settings')])
     const eligible = contactData.filter((contact) => contact.isActive && contact.whatsappOptIn)
     setCampaigns(campaignData); setTemplates(templateData); setContacts(eligible); setSettings(campaignSettings)
-    setSelectedIds((current) => current.length ? current : eligible.map((contact) => contact.id))
+    setSelectedIds((current) => current.filter((id) => eligible.some((contact) => contact.id === id)))
     const firstActive = templateData.find((template) => template.isActive)
     if (!templateId && firstActive) setTemplateId(firstActive.id)
   }
@@ -311,7 +312,7 @@ function CampaignsPage({ notify }: { notify: Notify }) {
     if (!preview) return void runPreview()
     if (busy) return
     setBusy('create')
-    try { const result = await api<{ recipientCount: number }>('/api/campaigns', { method: 'POST', headers: { 'Idempotency-Key': idempotencyKey }, body: JSON.stringify(payload()) }); setPreview(null); setIdempotencyKey(crypto.randomUUID()); await load(); notify(`Draft campaign dibuat untuk ${result.recipientCount} kontak`) }
+    try { const result = await api<{ recipientCount: number }>('/api/campaigns', { method: 'POST', headers: { 'Idempotency-Key': idempotencyKey }, body: JSON.stringify({ ...payload(), previewToken: preview.previewToken }) }); setPreview(null); setIdempotencyKey(crypto.randomUUID()); await load(); notify(`Draft campaign dibuat untuk ${result.recipientCount} kontak`) }
     catch (caught) { notify(caught instanceof Error ? caught.message : 'Campaign gagal dibuat') }
     finally { setBusy('') }
   }

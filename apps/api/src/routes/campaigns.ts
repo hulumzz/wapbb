@@ -1,4 +1,4 @@
-import { randomUUID } from 'node:crypto'
+import { createHash, randomUUID } from 'node:crypto'
 import type { FastifyInstance, FastifyReply } from 'fastify'
 import { and, desc, eq, getTableColumns, inArray, sql } from 'drizzle-orm'
 import { z } from 'zod'
@@ -11,12 +11,14 @@ import { renderMessageTemplate } from '../utils/template.js'
 
 const createCampaign = z.object({
   name: z.string().trim().min(2).max(120),
-  templateId: z.string().uuid(),
-  contactIds: z.array(z.string().uuid()).optional(),
+  templateId: z.string().uuid().optional(),
+  content: z.string().trim().min(1).max(4000).optional(),
+  previewToken: z.string().optional(),
+  contactIds: z.array(z.string().uuid()).min(1).max(1000),
   batchSize: z.coerce.number().int().min(1).max(50).default(config.DEFAULT_BATCH_SIZE),
   useBanner: z.boolean().default(false),
   useInteractiveCta: z.boolean().default(false),
-})
+}).refine((input) => input.content || input.templateId, 'Isi pesan atau template wajib diisi')
 
 type CampaignInput = z.infer<typeof createCampaign>
 
@@ -67,18 +69,18 @@ export async function registerCampaignRoutes(app: FastifyInstance) {
 
   app.post('/api/campaigns/preview', async (request, reply) => {
     const input = createCampaign.parse(request.body)
-    const [template] = await db.select().from(messageTemplates).where(and(
-      eq(messageTemplates.id, input.templateId),
-      eq(messageTemplates.isActive, true),
-    )).limit(1)
-    if (!template) return reply.code(400).send({ message: 'Template tidak ditemukan atau tidak aktif' })
+    const content = await resolveContent(input)
+    if (request.routeOptions.url?.startsWith('/integration/')) requireTargets(input)
 
-    const ctaUrl = validateInteractiveCta(input, template.content, reply)
+    const ctaUrl = validateInteractiveCta(input, content, reply)
     if (ctaUrl === null) return
 
     const recipients = await eligibleRecipients(input)
     if (!recipients.length) return reply.code(400).send({ message: 'Tidak ada kontak eligible untuk campaign ini' })
+    if (input.contactIds && recipients.length !== new Set(input.contactIds).size) return reply.code(409).send({ message: 'Penerima berubah atau tidak memenuhi persetujuan. Tinjau kembali.' })
+    const previewToken = app.jwt.sign({ kind: 'campaign-preview', requestHash: requestDigest(input), snapshotHash: snapshotDigest(content, recipients) }, { expiresIn: '15m' })
     return {
+      previewToken,
       recipientCount: recipients.length,
       useBanner: input.useBanner,
       useInteractiveCta: input.useInteractiveCta,
@@ -89,7 +91,7 @@ export async function registerCampaignRoutes(app: FastifyInstance) {
         contactId: contact.id,
         fullName: contact.fullName,
         recipient: contact.phoneNormalized,
-        renderedMessage: renderMessageTemplate(template.content, { nama: contact.fullName }),
+        renderedMessage: renderMessageTemplate(content, { nama: contact.fullName }),
         ctaUrl,
       })),
     }
@@ -98,7 +100,12 @@ export async function registerCampaignRoutes(app: FastifyInstance) {
   app.post('/api/campaigns', async (request, reply) => {
     const input = createCampaign.parse(request.body)
     const idempotencyKey = z.string().uuid().optional().parse(request.headers['idempotency-key'])
-    const requestHash = createCampaignRequestHash(input)
+    const requestHash = requestDigest(input)
+    const integrated = Boolean(request.routeOptions.url?.startsWith('/integration/'))
+    if (integrated) {
+      requireTargets(input)
+      if (!idempotencyKey) throw Object.assign(new Error('Idempotency-Key wajib diisi'), { statusCode: 400 })
+    }
 
     if (idempotencyKey) {
       const existing = await findIdempotentCampaign(idempotencyKey)
@@ -108,25 +115,29 @@ export async function registerCampaignRoutes(app: FastifyInstance) {
       }
     }
 
-    const [template] = await db.select().from(messageTemplates).where(and(
-      eq(messageTemplates.id, input.templateId),
-      eq(messageTemplates.isActive, true),
-    )).limit(1)
+    const content = await resolveContent(input)
 
-    if (!template) return reply.code(400).send({ message: 'Template tidak ditemukan atau tidak aktif' })
-
-    const ctaUrl = validateInteractiveCta(input, template.content, reply)
+    const ctaUrl = validateInteractiveCta(input, content, reply)
     if (ctaUrl === null) return
 
-    const recipients = await eligibleRecipients(input)
-    if (!recipients.length) return reply.code(400).send({ message: 'Tidak ada kontak eligible untuk campaign ini' })
-
     const campaignId = randomUUID()
+    let recipientCount = 0
     const created = await db.transaction(async (tx) => {
+      const recipients = await tx.select().from(contacts).where(and(eq(contacts.isActive, true), eq(contacts.whatsappOptIn, true), input.contactIds ? inArray(contacts.id, [...new Set(input.contactIds)]) : undefined)).orderBy(contacts.id).for('share')
+      if (!recipients.length || (input.contactIds && recipients.length !== new Set(input.contactIds).size)) throw Object.assign(new Error('Penerima berubah. Tinjau campaign kembali.'), { statusCode: 409 })
+      if (integrated || input.previewToken) {
+        let preview: { kind: string; requestHash: string; snapshotHash: string }
+        try { preview = app.jwt.verify(input.previewToken ?? '') }
+        catch { throw Object.assign(new Error('Pratinjau berakhir. Tinjau campaign kembali.'), { statusCode: 409 }) }
+        if (preview.kind !== 'campaign-preview' || preview.requestHash !== requestHash || preview.snapshotHash !== snapshotDigest(content, recipients)) throw Object.assign(new Error('Isi atau penerima berubah. Tinjau campaign kembali.'), { statusCode: 409 })
+      }
+      recipientCount = recipients.length
       const [inserted] = await tx.insert(campaigns).values({
         id: campaignId,
         name: input.name,
-        templateId: template.id,
+        templateId: input.templateId,
+        contentSnapshot: content,
+        bannerUrl: input.useBanner ? config.DEFAULT_BANNER_URL : null,
         batchSize: input.batchSize,
         useBanner: input.useBanner,
         useInteractiveCta: input.useInteractiveCta,
@@ -148,7 +159,7 @@ export async function registerCampaignRoutes(app: FastifyInstance) {
         campaignId,
         contactId: contact.id,
         recipient: contact.phoneNormalized,
-        renderedMessage: renderMessageTemplate(template.content, { nama: contact.fullName }),
+        renderedMessage: renderMessageTemplate(content, { nama: contact.fullName }),
         ctaUrl: input.useInteractiveCta ? ctaUrl : null,
         ctaLabel: input.useInteractiveCta ? config.INTERACTIVE_CTA_LABEL : null,
         ctaFooter: input.useInteractiveCta ? config.INTERACTIVE_CTA_FOOTER : null,
@@ -164,7 +175,7 @@ export async function registerCampaignRoutes(app: FastifyInstance) {
 
     return reply.code(201).send({
       id: campaignId,
-      recipientCount: recipients.length,
+      recipientCount,
       status: 'DRAFT',
       useBanner: input.useBanner,
       useInteractiveCta: input.useInteractiveCta,
@@ -191,6 +202,29 @@ export async function registerCampaignRoutes(app: FastifyInstance) {
     if (!cancelled) return reply.code(409).send({ message: 'Campaign tidak ditemukan atau sudah final' })
     return { ok: true }
   })
+
+  app.get('/api/campaigns/by-request/:key', async (request, reply) => {
+    const { key } = z.object({ key: z.string().uuid() }).parse(request.params)
+    const campaign = await findIdempotentCampaign(key)
+    return campaign ? withoutRequestHash(campaign) : reply.code(404).send({ message: 'Campaign belum ditemukan' })
+  })
+}
+
+function requestDigest(input: CampaignInput) {
+  const { previewToken: _token, ...payload } = input
+  return createCampaignRequestHash(payload)
+}
+function snapshotDigest(content: string, recipients: Array<typeof contacts.$inferSelect>) {
+  return createHash('sha256').update(JSON.stringify({ content, media: { bannerUrl: config.DEFAULT_BANNER_URL, ctaEnabled: config.INTERACTIVE_CTA_ENABLED, ctaLabel: config.INTERACTIVE_CTA_LABEL, ctaFooter: config.INTERACTIVE_CTA_FOOTER }, recipients: recipients.map((c) => ({ id: c.id, name: c.fullName, phone: c.phoneNormalized, version: c.updatedAt })).sort((a, b) => a.id.localeCompare(b.id)) })).digest('hex')
+}
+function requireTargets(input: CampaignInput) {
+  if (!input.content || !input.contactIds?.length) throw Object.assign(new Error('Isi pesan dan penerima eksplisit wajib diisi'), { statusCode: 400 })
+}
+async function resolveContent(input: CampaignInput) {
+  if (input.content && !input.templateId) return input.content
+  const [template] = await db.select().from(messageTemplates).where(and(eq(messageTemplates.id, input.templateId!), input.content ? undefined : eq(messageTemplates.isActive, true))).limit(1)
+  if (!template) throw Object.assign(new Error('Template tidak ditemukan atau tidak aktif'), { statusCode: 400 })
+  return input.content ?? template.content
 }
 
 async function findIdempotentCampaign(idempotencyKey: string) {

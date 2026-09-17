@@ -42,6 +42,11 @@ const envSchema = z.object({
   INTERACTIVE_CTA_ENABLED: z.enum(['true', 'false']).default('false').transform((value) => value === 'true'),
   INTERACTIVE_CTA_LABEL: z.string().trim().min(1).max(25).default('Buka informasi'),
   INTERACTIVE_CTA_FOOTER: z.string().trim().max(60).default('Informasi resmi desa'),
+  SID_OPERATOR_API_KEY: z.preprocess((value) => value === '' ? undefined : value, z.string().min(32).optional()),
+  SID_ADMIN_API_KEY: z.preprocess((value) => value === '' ? undefined : value, z.string().min(32).optional()),
 })
 
 export const config = envSchema.parse(process.env)
+if (config.SID_OPERATOR_API_KEY && config.SID_OPERATOR_API_KEY === config.SID_ADMIN_API_KEY) {
+  throw new Error('Key integrasi admin dan operator harus berbeda')
+}

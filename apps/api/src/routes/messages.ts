@@ -1,5 +1,5 @@
 import type { FastifyInstance } from 'fastify'
-import { and, desc, eq, inArray, or } from 'drizzle-orm'
+import { and, desc, eq, sql } from 'drizzle-orm'
 import { z } from 'zod'
 import { db } from '../db/client.js'
 import { campaigns, messageJobs } from '../db/schema.js'
@@ -18,6 +18,9 @@ export async function registerMessageRoutes(app: FastifyInstance) {
   app.post('/api/messages/:id/retry', async (request, reply) => {
     const params = z.object({ id: z.string().uuid() }).parse(request.params)
     const updated = await db.transaction(async (tx) => {
+      const [reference] = await tx.select({ campaignId: messageJobs.campaignId }).from(messageJobs).where(eq(messageJobs.id, params.id)).limit(1)
+      if (!reference) return null
+      await tx.select({ id: campaigns.id }).from(campaigns).where(eq(campaigns.id, reference.campaignId)).for('update')
       const [current] = await tx.select({
         job: messageJobs,
         campaignStatus: campaigns.status,
@@ -33,6 +36,8 @@ export async function registerMessageRoutes(app: FastifyInstance) {
       const now = new Date()
       const [job] = await tx.update(messageJobs).set({
         status: 'QUEUED',
+        generation: sql`${messageJobs.generation} + 1`,
+        providerMessageId: null,
         attempts: 0,
         scheduledAt: now,
         processingAt: null,

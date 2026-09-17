@@ -4,6 +4,9 @@ export type MessagingState = {
   status: MessagingStatus
   phoneNumber: string | null
   qrDataUrl: string | null
+  reason?: string | null
+  changedAt?: string
+  authPersistence?: 'healthy' | 'degraded'
 }
 
 export type SendTextInput = {
@@ -11,6 +14,8 @@ export type SendTextInput = {
   text: string
   idempotencyKey: string
   interactiveCta?: InteractiveCta
+  deadline?: number
+  beforeRelay?: () => Promise<void>
 }
 
 export type SendImageInput = {
@@ -19,6 +24,8 @@ export type SendImageInput = {
   caption: string
   idempotencyKey: string
   interactiveCta?: InteractiveCta
+  deadline?: number
+  beforeRelay?: () => Promise<void>
 }
 
 export type InteractiveCta = {

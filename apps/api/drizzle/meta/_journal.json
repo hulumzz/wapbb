@@ -36,6 +36,13 @@
       "when": 1789542271049,
       "tag": "0004_yummy_imperial_guard",
       "breakpoints": true
+    },
+    {
+      "idx": 5,
+      "version": "7",
+      "when": 1789626351952,
+      "tag": "0005_magenta_living_lightning",
+      "breakpoints": true
     }
   ]
 }

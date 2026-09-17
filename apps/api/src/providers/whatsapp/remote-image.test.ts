@@ -44,3 +44,14 @@ test('menandai kegagalan server sumber banner sebagai retryable', async () => {
       && error.retryable === true,
   )
 })
+
+test('menghentikan chunked banner sebelum buffer melewati batas', async () => {
+  let cancelled = false
+  const stream = new ReadableStream({ pull(controller) { controller.enqueue(new Uint8Array(1024)) }, cancel() { cancelled = true } })
+  await assert.rejects(fetchRemoteImage('https://media.example/image.png', { maxBytes: 1500, fetchImpl: async () => new Response(stream, { headers: { 'content-type': 'image/png' } }) }), (e: unknown) => e instanceof RemoteImageError && e.code === 'BANNER_TOO_LARGE')
+  assert.equal(cancelled, true)
+})
+test('body yang rusak dicatat sebagai error media retryable', async () => {
+  const stream = new ReadableStream({ start(controller) { controller.error(new Error('connection lost')) } })
+  await assert.rejects(fetchRemoteImage('https://media.example/image.png', { fetchImpl: async () => new Response(stream, { headers: { 'content-type': 'image/png' } }) }), (e: unknown) => e instanceof RemoteImageError && e.code === 'BANNER_BODY_FAILED')
+})

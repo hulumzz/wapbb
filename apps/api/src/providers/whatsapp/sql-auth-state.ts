@@ -1,9 +1,10 @@
 import { createCipheriv, createDecipheriv, createHash, randomBytes } from 'node:crypto'
 import { BufferJSON, initAuthCreds, proto, type AuthenticationState } from '@whiskeysockets/baileys'
-import { and, eq, inArray } from 'drizzle-orm'
+import { and, eq, inArray, sql } from 'drizzle-orm'
 import { config } from '../../config.js'
 import { db } from '../../db/client.js'
-import { whatsappAuth } from '../../db/schema.js'
+import { messagingLeases, whatsappAuth } from '../../db/schema.js'
+import { SerialWrites } from '../../utils/serial-writes.js'
 
 const encryptionKey = createHash('sha256').update(config.WA_SESSION_ENCRYPTION_KEY).digest()
 
@@ -43,19 +44,30 @@ async function readValue<T>(accountId: string, key: string): Promise<T | undefin
     .where(and(eq(whatsappAuth.accountId, accountId), eq(whatsappAuth.key, key)))
     .limit(1)
 
-  return row ? decrypt<T>(row.value, accountId, key) : undefined
+  if (!row) return undefined
+  try { return decrypt<T>(row.value, accountId, key) }
+  catch { throw Object.assign(new Error('Auth-state tidak dapat didekripsi'), { code: 'AUTH_STATE_INVALID' }) }
 }
 
-async function writeValue(accountId: string, key: string, value: unknown): Promise<void> {
+type AuthTransaction = Parameters<Parameters<typeof db.transaction>[0]>[0]
+async function assertOwnership(tx: AuthTransaction, accountId: string, owner?: string) {
+  if (!owner) return
+  const [lease] = await tx.select().from(messagingLeases).where(and(eq(messagingLeases.name, `whatsapp:${accountId}`), eq(messagingLeases.owner, owner), sql`${messagingLeases.expiresAt} > NOW()`)).for('share')
+  if (!lease) throw new Error('Auth persistence stopped: session lease lost')
+}
+async function writeValue(accountId: string, key: string, value: unknown, owner?: string): Promise<void> {
   const encrypted = encrypt(value, accountId, key)
-  await db.insert(whatsappAuth).values({
-    accountId,
-    key,
-    value: encrypted,
-    updatedAt: new Date(),
-  }).onConflictDoUpdate({
-    target: [whatsappAuth.accountId, whatsappAuth.key],
-    set: { value: encrypted, updatedAt: new Date() },
+  await db.transaction(async (tx) => {
+    await assertOwnership(tx, accountId, owner)
+    await tx.insert(whatsappAuth).values({
+      accountId,
+      key,
+      value: encrypted,
+      updatedAt: new Date(),
+    }).onConflictDoUpdate({
+      target: [whatsappAuth.accountId, whatsappAuth.key],
+      set: { value: encrypted, updatedAt: new Date() },
+    })
   })
 }
 
@@ -67,18 +79,19 @@ export async function clearStoredAuthState(accountId: string): Promise<void> {
   await db.delete(whatsappAuth).where(eq(whatsappAuth.accountId, accountId))
 }
 
-export async function createSqlAuthState(accountId: string): Promise<{
+export async function createSqlAuthState(accountId: string, owner?: string): Promise<{
   state: AuthenticationState
   saveCreds: () => Promise<void>
   clear: () => Promise<void>
+  flush: () => Promise<void>
 }> {
   const creds = (await readValue<AuthenticationState['creds']>(accountId, 'creds')) ?? initAuthCreds()
-  let saveChain = Promise.resolve()
+  const writes = new SerialWrites()
   let acceptingSaves = true
   const clear = async () => {
     acceptingSaves = false
-    await saveChain.catch(() => undefined)
-    await clearStoredAuthState(accountId)
+    await writes.stop().catch(() => undefined)
+    await db.transaction(async (tx) => { await assertOwnership(tx, accountId, owner); await tx.delete(whatsappAuth).where(eq(whatsappAuth.accountId, accountId)) })
   }
 
   const keys: AuthenticationState['keys'] = {
@@ -103,9 +116,15 @@ export async function createSqlAuthState(accountId: string): Promise<{
       return result as never
     },
     set: async (data) => {
-      await db.transaction(async (tx) => {
-        for (const [type, entries] of Object.entries(data)) {
-          for (const [id, value] of Object.entries(entries ?? {})) {
+      if (!acceptingSaves) return
+      // Capture values before queuing: Baileys may mutate the originals.
+      const snapshot = JSON.parse(JSON.stringify(data, BufferJSON.replacer), BufferJSON.reviver) as typeof data
+      await writes.run(() => db.transaction(async (tx) => {
+        await assertOwnership(tx, accountId, owner)
+        const deadline = Date.now() + 5000
+        for (const [type, entries] of Object.entries(snapshot).sort(([a], [b]) => a.localeCompare(b))) {
+          for (const [id, value] of Object.entries(entries ?? {}).sort(([a], [b]) => a.localeCompare(b))) {
+            if (Date.now() >= deadline) throw new Error('Auth persistence transaction budget exceeded')
             const key = `${type}:${id}`
             if (value === null || value === undefined) {
               await tx.delete(whatsappAuth).where(
@@ -125,7 +144,7 @@ export async function createSqlAuthState(accountId: string): Promise<{
             }
           }
         }
-      })
+      }))
     },
     clear,
   }
@@ -134,9 +153,10 @@ export async function createSqlAuthState(accountId: string): Promise<{
     state: { creds, keys },
     saveCreds: () => {
       if (!acceptingSaves) return Promise.resolve()
-      saveChain = saveChain.catch(() => undefined).then(() => writeValue(accountId, 'creds', creds))
-      return saveChain
+      const snapshot = JSON.parse(JSON.stringify(creds, BufferJSON.replacer), BufferJSON.reviver)
+      return writes.run(() => writeValue(accountId, 'creds', snapshot, owner))
     },
     clear,
+    flush: async () => { acceptingSaves = false; await writes.stop() },
   }
 }

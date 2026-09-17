@@ -1,234 +1,88 @@
 import { randomUUID } from 'node:crypto'
 import type { FastifyInstance } from 'fastify'
-import { and, asc, eq, inArray, sql } from 'drizzle-orm'
+import { and, asc, eq, sql } from 'drizzle-orm'
 import { config } from '../config.js'
 import { db } from '../db/client.js'
-import { campaigns, messageJobs } from '../db/schema.js'
+import { campaigns, contacts, messageAttempts, messageJobs } from '../db/schema.js'
 import { confirmsSubmission } from '../providers/whatsapp/delivery-status.js'
 import { shouldRetryAutomatically } from '../providers/whatsapp/retry-policy.js'
 import { MessagingProviderError, type MessagingProvider } from '../providers/whatsapp/types.js'
 import { createStableMessageId } from '../utils/idempotency.js'
+import { acquireLease, releaseLease } from '../utils/lease.js'
 import { safeSecretEqual } from '../utils/secret.js'
 
 export async function registerInternalRoutes(app: FastifyInstance, provider: MessagingProvider) {
   app.post('/internal/dispatch', async (request, reply) => {
-    if (!safeSecretEqual(request.headers.authorization, `Bearer ${config.INTERNAL_DISPATCH_SECRET}`)) {
-      return reply.code(401).send({ message: 'Unauthorized' })
-    }
-
-    const [campaign] = await db.select().from(campaigns)
-      .where(eq(campaigns.status, 'RUNNING'))
-      .orderBy(asc(campaigns.createdAt))
-      .limit(1)
-
-    // Scheduler tetap mendapat HTTP 200 ketika antrean memang sedang kosong,
-    // walaupun instance WhatsApp belum tersambung.
-    if (!campaign) return { processed: 0, message: 'Tidak ada campaign aktif' }
-
-    const state = await provider.getStatus()
-    if (state.status !== 'CONNECTED') {
-      return reply.code(409).send({ message: 'WhatsApp belum terhubung', status: state.status })
-    }
-
-    const staleBefore = new Date(Date.now() - config.PROCESSING_TIMEOUT_MINUTES * 60_000)
-    const staleJobs = await db.execute(sql`
-      UPDATE message_jobs
-      SET status = 'FAILED',
-          processing_token = NULL,
-          delivery_status = 'UNKNOWN',
-          error_code = 'DELIVERY_UNKNOWN_AFTER_RESTART',
-          error_message = 'Status pengiriman tidak dapat dipastikan setelah worker berhenti. Periksa sebelum retry manual.',
-          updated_at = NOW()
-      WHERE status = 'PROCESSING' AND processing_at < ${staleBefore}
-      RETURNING id
-    `)
-    await db.execute(sql`
-      UPDATE message_jobs
-      SET status = 'FAILED',
-          delivery_status = COALESCE(delivery_status, 'ERROR'),
-          error_code = 'MAX_ATTEMPTS_REACHED',
-          error_message = 'Batas percobaan pengiriman telah tercapai.',
-          updated_at = NOW()
-      WHERE status = 'QUEUED' AND attempts >= max_attempts
-    `)
-
-    const processingToken = randomUUID()
-    const claimed = await db.transaction(async (tx) => {
-      const result = await tx.execute(sql`
-        WITH candidates AS (
-          SELECT job.id
-          FROM message_jobs job
-          INNER JOIN campaigns campaign ON campaign.id = job.campaign_id
-          WHERE job.campaign_id = ${campaign.id}
-            AND campaign.status = 'RUNNING'
-            AND job.status = 'QUEUED'
-            AND job.attempts < job.max_attempts
-            AND job.scheduled_at <= NOW()
-          ORDER BY job.created_at ASC
-          FOR UPDATE SKIP LOCKED
-          LIMIT ${campaign.batchSize}
-        )
-        UPDATE message_jobs job
-        SET status = 'PROCESSING',
-            processing_at = NOW(),
-            processing_token = ${processingToken},
-            attempts = job.attempts + 1,
-            error_code = NULL,
-            error_message = NULL,
-            updated_at = NOW()
-        WHERE job.id IN (SELECT id FROM candidates)
-        RETURNING job.id, job.recipient, job.rendered_message, job.attempts, job.max_attempts,
-          job.cta_url, job.cta_label, job.cta_footer
-      `)
-      return result.rows as Array<{
-        id: string
-        recipient: string
-        rendered_message: string
-        attempts: number
-        max_attempts: number
-        cta_url: string | null
-        cta_label: string | null
-        cta_footer: string | null
-      }>
-    })
-
-    let sent = 0
-    let failed = 0
-    let retried = 0
-    let circuitBroken = false
-
-    for (const [index, job] of claimed.entries()) {
-      const stableMessageId = createStableMessageId(job.id)
-      await db.update(messageJobs).set({
-        providerMessageId: stableMessageId,
-        updatedAt: new Date(),
-      }).where(and(
-        eq(messageJobs.id, job.id),
-        eq(messageJobs.status, 'PROCESSING'),
-        eq(messageJobs.processingToken, processingToken),
-      ))
-
-      const interactiveCta = config.INTERACTIVE_CTA_ENABLED && job.cta_url && job.cta_label && job.cta_footer
-        ? { url: job.cta_url, label: job.cta_label, footer: job.cta_footer }
-        : undefined
-
-      try {
-        const result = campaign.useBanner
-          ? await provider.sendImage({
-              recipient: job.recipient,
-              imageUrl: config.DEFAULT_BANNER_URL,
-              caption: job.rendered_message,
-              idempotencyKey: job.id,
-              interactiveCta,
-            })
-          : await provider.sendText({
-              recipient: job.recipient,
-              text: job.rendered_message,
-              idempotencyKey: job.id,
-              interactiveCta,
-            })
-        await db.update(messageJobs).set({
-          status: 'SENT',
-          sentAt: new Date(),
-          providerMessageId: result.providerMessageId,
-          deliveryStatus: sql`COALESCE(${messageJobs.deliveryStatus}, 'PENDING')`,
-          processingAt: null,
-          processingToken: null,
-          updatedAt: new Date(),
-        }).where(and(
-          eq(messageJobs.id, job.id),
-          eq(messageJobs.status, 'PROCESSING'),
-          eq(messageJobs.processingToken, processingToken),
-        ))
-        sent += 1
-      } catch (error) {
-        const providerError = error instanceof MessagingProviderError
-          ? error
-          : new MessagingProviderError('Pengiriman gagal tanpa detail provider', 'PROVIDER_ERROR', false, true)
-        const [receipt] = await db.select({ deliveryStatus: messageJobs.deliveryStatus })
-          .from(messageJobs)
-          .where(eq(messageJobs.id, job.id))
-          .limit(1)
-        if (confirmsSubmission(receipt?.deliveryStatus)) {
-          await db.update(messageJobs).set({
-            status: 'SENT',
-            sentAt: new Date(),
-            processingAt: null,
-            processingToken: null,
-            errorCode: null,
-            errorMessage: null,
-            updatedAt: new Date(),
-          }).where(and(
-            eq(messageJobs.id, job.id),
-            eq(messageJobs.status, 'PROCESSING'),
-            eq(messageJobs.processingToken, processingToken),
-          ))
-          sent += 1
-          continue
+    if (!safeSecretEqual(request.headers.authorization, `Bearer ${config.INTERNAL_DISPATCH_SECRET}`)) return reply.code(401).send({ message: 'Unauthorized' })
+    const token = randomUUID(), deadline = Date.now() + 25_000
+    if (!await acquireLease('dispatch:default', token)) return { processed: 0, message: 'Dispatcher sedang berjalan' }
+    try {
+      const [campaign] = await db.select().from(campaigns).where(eq(campaigns.status, 'RUNNING')).orderBy(asc(campaigns.createdAt)).limit(1)
+      if (!campaign) return { processed: 0, message: 'Tidak ada campaign aktif' }
+      const state = await provider.getStatus()
+      if (state.status !== 'CONNECTED' || state.authPersistence === 'degraded') return reply.code(409).send({ message: 'WhatsApp belum siap mengirim', status: state.status, reason: state.reason })
+      const stale = await db.execute(sql`UPDATE message_jobs SET status = 'FAILED', processing_token = NULL, processing_at = NULL, delivery_status = 'UNKNOWN', error_code = 'DELIVERY_UNKNOWN_AFTER_RESTART', error_message = 'Periksa pengiriman sebelum retry manual.', updated_at = NOW() WHERE status = 'PROCESSING' AND processing_at < NOW() - ${config.PROCESSING_TIMEOUT_MINUTES} * INTERVAL '1 minute' RETURNING id`)
+      await db.execute(sql`UPDATE message_jobs SET status = 'FAILED', error_code = 'MAX_ATTEMPTS_REACHED', error_message = 'Batas percobaan tercapai.', updated_at = NOW() WHERE status = 'QUEUED' AND attempts >= max_attempts`)
+      let sent = 0, failed = 0, retried = 0, skipped = 0, claimed = 0
+      let circuitBroken = false
+      for (let index = 0; index < campaign.batchSize && Date.now() < deadline - 3000; index++) {
+        const job = await db.transaction(async (tx) => {
+          const [current] = await tx.select().from(campaigns).where(eq(campaigns.id, campaign.id)).for('update')
+          if (current?.status !== 'RUNNING') return null
+          const [candidate] = await tx.select().from(messageJobs).where(and(eq(messageJobs.campaignId, campaign.id), eq(messageJobs.status, 'QUEUED'), sql`${messageJobs.scheduledAt} <= NOW()`, sql`${messageJobs.attempts} < ${messageJobs.maxAttempts}`)).orderBy(asc(messageJobs.createdAt), asc(messageJobs.id)).for('update', { skipLocked: true }).limit(1)
+          if (!candidate) return null
+          const providerMessageId = createStableMessageId(candidate.generation ? `${candidate.id}:${candidate.generation}` : candidate.id)
+          await tx.insert(messageAttempts).values({ providerMessageId, jobId: candidate.id, generation: candidate.generation }).onConflictDoNothing()
+          const [updated] = await tx.update(messageJobs).set({ status: 'PROCESSING', attempts: candidate.attempts + 1, processingAt: new Date(), processingToken: token, providerMessageId, errorCode: null, errorMessage: null, updatedAt: new Date() }).where(eq(messageJobs.id, candidate.id)).returning()
+          return updated
+        })
+        if (!job) break
+        claimed++
+        const owns = and(eq(messageJobs.id, job.id), eq(messageJobs.status, 'PROCESSING'), eq(messageJobs.processingToken, token))
+        const beforeRelay = async () => {
+          if (Date.now() >= deadline - 1000) throw new MessagingProviderError('Budget dispatch berakhir', 'PREPARATION_INTERRUPTED', true)
+          if (!await acquireLease('dispatch:default', token)) throw new MessagingProviderError('Lease dispatcher hilang', 'PROVIDER_DISCONNECTED', true)
+          await db.transaction(async (tx) => {
+            const [currentCampaign] = await tx.select().from(campaigns).where(eq(campaigns.id, campaign.id)).for('share')
+            const [currentJob] = await tx.select().from(messageJobs).where(owns).for('share')
+            if (!currentJob || currentCampaign?.status !== 'RUNNING') throw new MessagingProviderError('Campaign atau claim berubah', 'STOP_CAMPAIGN', false)
+            const [contact] = await tx.select().from(contacts).where(eq(contacts.id, job.contactId)).for('share')
+            if (!contact?.isActive || !contact.whatsappOptIn || contact.phoneNormalized !== job.recipient) throw new MessagingProviderError('Kontak nonaktif, opt-out, atau nomor berubah setelah preview', 'SKIP_CONTACT', false)
+          })
         }
-
-        const shouldRetry = shouldRetryAutomatically(providerError, job.attempts, job.max_attempts)
-        const retryDelay = config.RETRY_DELAY_SECONDS * (2 ** Math.max(job.attempts - 1, 0))
-        await db.update(messageJobs).set({
-          status: shouldRetry ? 'QUEUED' : 'FAILED',
-          deliveryStatus: providerError.deliveryUncertain ? 'UNKNOWN' : shouldRetry ? null : 'ERROR',
-          scheduledAt: shouldRetry ? new Date(Date.now() + retryDelay * 1000) : undefined,
-          processingAt: null,
-          processingToken: null,
-          errorCode: providerError.code,
-          errorMessage: providerError.message.slice(0, 500),
-          updatedAt: new Date(),
-        }).where(and(
-          eq(messageJobs.id, job.id),
-          eq(messageJobs.status, 'PROCESSING'),
-          eq(messageJobs.processingToken, processingToken),
-        ))
-        if (shouldRetry) retried += 1
-        else failed += 1
-
-        const currentState = await provider.getStatus()
-        if (providerError.code === 'PROVIDER_DISCONNECTED' || currentState.status !== 'CONNECTED') {
-          circuitBroken = true
-          const untouched = claimed.slice(index + 1).map((item) => item.id)
-          if (untouched.length) {
-            await db.update(messageJobs).set({
-              status: 'QUEUED',
-              attempts: sql`GREATEST(${messageJobs.attempts} - 1, 0)`,
-              processingAt: null,
-              processingToken: null,
-              updatedAt: new Date(),
-            }).where(and(
-              inArray(messageJobs.id, untouched),
-              eq(messageJobs.status, 'PROCESSING'),
-              eq(messageJobs.processingToken, processingToken),
-            ))
-          }
-          break
+        const interactiveCta = config.INTERACTIVE_CTA_ENABLED && job.ctaUrl && job.ctaLabel && job.ctaFooter !== null ? { url: job.ctaUrl, label: job.ctaLabel, footer: job.ctaFooter } : undefined
+        const input = { recipient: job.recipient, idempotencyKey: job.generation ? `${job.id}:${job.generation}` : job.id, interactiveCta, deadline: deadline - 1000, beforeRelay }
+        let sendStarted = false
+        try {
+          await beforeRelay()
+          sendStarted = true
+          if (campaign.useBanner) await provider.sendImage({ ...input, imageUrl: campaign.bannerUrl ?? config.DEFAULT_BANNER_URL, caption: job.renderedMessage })
+          else await provider.sendText({ ...input, text: job.renderedMessage })
+          await db.update(messageJobs).set({ status: 'SENT', sentAt: new Date(), deliveryStatus: sql`COALESCE(${messageJobs.deliveryStatus}, 'PENDING')`, processingAt: null, processingToken: null, updatedAt: new Date() }).where(owns)
+          const [final] = await db.select({ status: messageJobs.status }).from(messageJobs).where(eq(messageJobs.id, job.id))
+          if (final?.status === 'SENT') sent++; else failed++
+        } catch (error) {
+          const failure = error instanceof MessagingProviderError ? error : new MessagingProviderError(sendStarted ? 'Hasil pengiriman tidak dapat dipastikan' : 'Pemeriksaan sebelum relay gagal', sendStarted ? 'DELIVERY_UNCERTAIN' : 'PREPARATION_CHECK_FAILED', !sendStarted, sendStarted)
+          const [receipt] = await db.select({ deliveryStatus: messageJobs.deliveryStatus }).from(messageJobs).where(eq(messageJobs.id, job.id))
+          if (confirmsSubmission(receipt?.deliveryStatus)) { sent++; continue }
+          const stopped = failure.code === 'STOP_CAMPAIGN', ignored = failure.code === 'SKIP_CONTACT'
+          const retry = stopped || shouldRetryAutomatically(failure, job.attempts, job.maxAttempts)
+          await db.transaction(async (tx) => {
+            const [currentCampaign] = await tx.select().from(campaigns).where(eq(campaigns.id, campaign.id)).for('update')
+            const cancelled = !failure.deliveryUncertain && currentCampaign?.status === 'CANCELLED'
+            await tx.update(messageJobs).set({ status: cancelled ? 'CANCELLED' : ignored ? 'SKIPPED' : retry ? 'QUEUED' : 'FAILED', attempts: stopped ? job.attempts - 1 : job.attempts, deliveryStatus: failure.deliveryUncertain ? 'UNKNOWN' : retry || ignored ? null : 'ERROR', processingAt: null, processingToken: null, scheduledAt: retry && !stopped ? new Date(Date.now() + config.RETRY_DELAY_SECONDS * 2 ** Math.max(job.attempts - 1, 0) * 1000) : undefined, errorCode: failure.code, errorMessage: failure.message, updatedAt: new Date() }).where(owns)
+          })
+          if (ignored) skipped++; else if (retry) retried++; else failed++
+          if (stopped || (await provider.getStatus()).status !== 'CONNECTED') { circuitBroken = true; break }
         }
       }
-    }
-
-    const [remaining] = await db.select({ count: sql<number>`count(*)` }).from(messageJobs).where(sql`
-      ${messageJobs.campaignId} = ${campaign.id}
-      AND ${messageJobs.status} IN ('QUEUED', 'PROCESSING')
-    `)
-    if (Number(remaining.count) === 0) {
-      await db.update(campaigns).set({ status: 'COMPLETED', completedAt: new Date(), updatedAt: new Date() }).where(and(
-        eq(campaigns.id, campaign.id),
-        eq(campaigns.status, 'RUNNING'),
-      ))
-    }
-
-    return {
-      processed: sent + failed + retried,
-      claimed: claimed.length,
-      submitted: sent,
-      sent,
-      failed,
-      retried,
-      circuitBroken,
-      recoveredAsUnknown: staleJobs.rows.length,
-      campaignId: campaign.id,
-    }
+      await db.transaction(async (tx) => {
+        const [current] = await tx.select().from(campaigns).where(eq(campaigns.id, campaign.id)).for('update')
+        if (current?.status !== 'RUNNING') return
+        const [remaining] = await tx.select({ count: sql<number>`count(*)::int` }).from(messageJobs).where(and(eq(messageJobs.campaignId, campaign.id), sql`${messageJobs.status} IN ('QUEUED', 'PROCESSING')`))
+        if (!remaining.count) await tx.update(campaigns).set({ status: 'COMPLETED', completedAt: new Date(), updatedAt: new Date() }).where(eq(campaigns.id, campaign.id))
+      })
+      return { processed: sent + failed + retried + skipped, claimed, submitted: sent, sent, failed, retried, skipped, circuitBroken, recoveredAsUnknown: stale.rows.length, campaignId: campaign.id }
+    } finally { await releaseLease('dispatch:default', token).catch(() => undefined) }
   })
 }

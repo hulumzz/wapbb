@@ -1,6 +1,6 @@
-# WA PBB Reminder
+# Layanan Pesan WhatsApp Desa
 
-Aplikasi standalone ringan untuk mengelola kontak dan antrean reminder WhatsApp. Scope V1 sengaja sederhana: **nama lengkap + nomor WhatsApp**, template pesan, campaign, queue, history, dan koneksi WhatsApp.
+Backend messaging ringan untuk informasi umum desa, dengan panel React cadangan dan integrasi admin Laravel SIDDes. Scope V1: nama perwakilan rumah + nomor WhatsApp, template/pesan langsung, campaign, queue, riwayat, dan koneksi WhatsApp. Tidak terhubung KK atau status pembayaran.
 
 > Baca [`blueprint.md`](./blueprint.md) sebelum mengubah arsitektur. Dokumen tersebut adalah sumber konteks utama project dan harus tetap berada di repository.
 
@@ -14,7 +14,7 @@ Aplikasi standalone ringan untuk mengelola kontak dan antrean reminder WhatsApp.
 
 ## Menjalankan lokal
 
-1. Gunakan Node.js 20.19 atau lebih baru (sesuai requirement Vite 8).
+1. Gunakan Node.js 22.19 atau lebih baru (termasuk dependensi link preview yang telah diperbarui).
 2. Copy `.env.example` menjadi `.env` di root repository.
 3. Isi minimal:
    - `DATABASE_URL`
@@ -110,7 +110,7 @@ Status queue `SENT` dipertahankan untuk kompatibilitas rollback `main`, tetapi U
 
 Default batch saat ini adalah 10, tetapi dapat diubah per campaign. Batch digunakan untuk kontrol operasional dan resource, bukan sebagai jaminan untuk menghindari sistem anti-spam WhatsApp.
 
-Campaign dapat berjalan sebagai text-only atau menggunakan banner. Banner diambil dari `DEFAULT_BANNER_URL` saat dispatch, tidak disimpan ke database/filesystem, dan dikirim sebagai media image dengan snapshot template sebagai caption. Pesan text-only yang memuat URL memakai link preview Baileys; kegagalan membuat preview tidak membatalkan pengiriman teks.
+Campaign default text-only; banner opsional memakai snapshot `DEFAULT_BANNER_URL` saat draft dibuat. Bytes hanya di memory sementara, tidak di database/filesystem; caption memakai pesan final. Link preview dan thumbnail memakai DNS tervalidasi/pinned (termasuk redirect), batas ukuran/waktu, dan high-quality media Baileys. Kegagalan preview tidak membatalkan pengiriman teks.
 
 ### Tombol tindakan WhatsApp
 
@@ -120,10 +120,7 @@ Kill switch default tetap `false`. Setelah pilot perangkat berhasil, aktifkan en
 
 Fitur memakai native-flow protokol WhatsApp Web melalui Baileys. Status receipt membedakan pesan yang baru diserahkan, diterima server, terkirim ke perangkat, dan dibaca. Receipt perangkat tidak menjamin setiap versi aplikasi merender tombol dengan tampilan identik, sehingga pilot lintas Android/iOS/Web tetap diperlukan.
 
-Workflow contoh tersedia di `.github/workflows/dispatcher.yml`. Tambahkan repository secrets:
-
-- `DISPATCH_URL`, contoh `https://service.example.com/internal/dispatch`
-- `DISPATCH_SECRET`, harus sama dengan `INTERNAL_DISPATCH_SECRET`
+Workflow GitHub telah dihapus. Gunakan cron-job.org: POST `/internal/dispatch`, bearer `INTERNAL_DISPATCH_SECRET`, header JSON, body `{}`, setiap10menit, timeout30detik. Warm-up GET `/health` dua menit sebelumnya opsional; cold start Render tetap dapat melampaui timeout.
 
 ## Deploy ke Render
 
@@ -174,7 +171,8 @@ Sudah tersedia sebagai fondasi:
 - retry/backoff, circuit breaker, stale-job recovery konservatif, dan retry manual
 - migration SQL versioned serta startup migration di Render
 - Render Blueprint
-- scheduler workflow
+- API integrasi SIDDes dengan scope admin/operator, pagination, signed preview dan idempotensi
+- session/dispatcher lease, metadata outbound encrypted dan generasi attempt
 
 Belum selesai/divalidasi:
 
@@ -183,11 +181,11 @@ Belum selesai/divalidasi:
 
 Bagian tersebut sengaja tetap di luar core awal sebagaimana dijelaskan di `blueprint.md`.
 
-## CI
+## Validasi lokal dan integrasi SIDDes
 
-`.github/workflows/ci.yml` disiapkan untuk menjalankan install, typecheck, dan build pada push/PR.
+Jalankan `npm run typecheck`, `npm test`, `npm run build`, dan `npm run db:check`. Test konkurensi memakai PostgreSQL ephemeral di tempdir, bukan DATABASE_URL produksi. Node minimal22.19; `sharp` dipin untuk thumbnail/media image. `.npmrc` mengizinkan patched link-preview-js5 walaupun peer optional Baileys masih versi3; jangan memakai versi rentan hanya untuk menghilangkan warning peer `npm ls`.
 
-Jika workflow tidak mendapatkan runner dan berhenti sebelum step pertama, periksa ketersediaan/izin GitHub Actions pada repository atau akun. Kondisi tersebut berbeda dari kegagalan compile pada source code.
+Isi `SID_OPERATOR_API_KEY` dan `SID_ADMIN_API_KEY` di environment API Render, masing-masing random minimal32karakter dan berbeda. Nilai yang sama disimpan server-side Laravel sebagai `MESSAGING_OPERATOR_API_KEY`/`MESSAGING_ADMIN_API_KEY`. Laravel memakai `MESSAGING_API_URL` dan flag `MESSAGING_ENABLED`; browser tidak menerima key. Panduan lengkap SIDDes berada di `docs/whatsapp-messaging.md`; kontrak dan rollback tercatat di blueprint bagian22. Jangan menjalankan API lokal dan Render pada session/database produksi yang sama.
 
 ## Catatan keamanan
 

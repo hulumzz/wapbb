@@ -26,7 +26,9 @@ export const messageTemplates = pgTable('message_templates', {
 export const campaigns = pgTable('campaigns', {
   id: text('id').primaryKey(),
   name: text('name').notNull(),
-  templateId: text('template_id').notNull().references(() => messageTemplates.id),
+  templateId: text('template_id').references(() => messageTemplates.id),
+  contentSnapshot: text('content_snapshot'),
+  bannerUrl: text('banner_url'),
   status: text('status').notNull().default('DRAFT'),
   batchSize: integer('batch_size').notNull().default(10),
   useBanner: boolean('use_banner').notNull().default(false),
@@ -70,6 +72,7 @@ export const messageJobs = pgTable('message_jobs', {
   processingToken: text('processing_token'),
   sentAt: timestamp('sent_at', { withTimezone: true }),
   providerMessageId: text('provider_message_id'),
+  generation: integer('generation').notNull().default(0),
   deliveryStatus: text('delivery_status'),
   serverAckAt: timestamp('server_ack_at', { withTimezone: true }),
   deliveredAt: timestamp('delivered_at', { withTimezone: true }),
@@ -110,3 +113,29 @@ export const whatsappAuth = pgTable('whatsapp_auth', {
   value: text('value').notNull(),
   updatedAt: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
 }, (table) => [primaryKey({ columns: [table.accountId, table.key] })])
+
+export const messagingLeases = pgTable('messaging_leases', {
+  name: text('name').primaryKey(),
+  owner: text('owner').notNull(),
+  expiresAt: timestamp('expires_at', { withTimezone: true }).notNull(),
+})
+
+export const messageAttempts = pgTable('message_attempts', {
+  providerMessageId: text('provider_message_id').primaryKey(),
+  jobId: text('job_id').notNull().references(() => messageJobs.id, { onDelete: 'cascade' }),
+  generation: integer('generation').notNull(),
+  outboundCiphertext: text('outbound_ciphertext'),
+  deliveryStatus: text('delivery_status'),
+  createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+  updatedAt: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
+}, (table) => [index('message_attempts_job_idx').on(table.jobId)])
+
+export const messagingAudit = pgTable('messaging_audit', {
+  id: text('id').primaryKey(),
+  actor: text('actor').notNull(),
+  source: text('source').notNull(),
+  action: text('action').notNull(),
+  objectId: text('object_id'),
+  result: integer('result').notNull(),
+  createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+})

@@ -12,6 +12,11 @@ const templateInput = z.object({
 })
 
 export async function registerTemplateRoutes(app: FastifyInstance) {
+  app.get('/api/templates/:id', async (request, reply) => {
+    const { id } = z.object({ id: z.string().uuid() }).parse(request.params)
+    const [template] = await db.select().from(messageTemplates).where(eq(messageTemplates.id, id)).limit(1)
+    return template ?? reply.code(404).send({ message: 'Template tidak ditemukan' })
+  })
   app.get('/api/templates', async () => db.select().from(messageTemplates).orderBy(desc(messageTemplates.createdAt)))
 
   app.post('/api/templates', async (request, reply) => {

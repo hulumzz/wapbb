@@ -2,7 +2,8 @@ import { createHash } from 'node:crypto'
 
 type CampaignRequest = {
   name: string
-  templateId: string
+  templateId?: string
+  content?: string
   contactIds?: string[]
   batchSize: number
   useBanner: boolean

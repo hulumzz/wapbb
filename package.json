@@ -4,8 +4,10 @@
   "private": true,
   "workspaces": ["apps/*"],
   "engines": {
-    "node": ">=20.19.0"
+    "node": ">=22.19.0"
   },
+  "overrides": { "link-preview-js": "5.0.0" },
+  "dependencies": { "link-preview-js": "5.0.0", "sharp": "0.35.4" },
   "scripts": {
     "dev:api": "npm run dev -w @wapbb/api",
     "dev:web": "npm run dev -w @wapbb/web",

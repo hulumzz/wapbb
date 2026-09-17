@@ -1,4 +1,5 @@
-import Fastify from 'fastify'
+import { randomUUID } from 'node:crypto'
+import Fastify, { type RouteOptions } from 'fastify'
 import cors from '@fastify/cors'
 import jwt from '@fastify/jwt'
 import rateLimit from '@fastify/rate-limit'
@@ -15,13 +16,22 @@ import { registerInternalRoutes } from './routes/internal.js'
 import { registerMessageRoutes } from './routes/messages.js'
 import { registerTemplateRoutes } from './routes/templates.js'
 import { registerWhatsappRoutes } from './routes/whatsapp.js'
+import { integrationListHandler, registerIntegrationRoutes } from './routes/integration.js'
+import { messagingAudit } from './db/schema.js'
+import { safeSecretEqual } from './utils/secret.js'
+import type { MessagingProvider } from './providers/whatsapp/types.js'
 
-export async function buildApp() {
+export async function buildApp(options: { provider?: MessagingProvider; restore?: boolean } = {}) {
   const app = Fastify({
-    logger: true,
+    logger: { redact: ['req.headers.authorization', 'req.headers.cookie', 'res.headers.set-cookie'] },
     trustProxy: config.NODE_ENV === 'production',
   })
-  const whatsapp = new BaileysProvider()
+  const whatsapp = options.provider ?? new BaileysProvider()
+  const sharedRoutes: RouteOptions[] = []
+  const auditedObjects = new WeakMap<object, string>()
+  app.addHook('onRoute', (route) => {
+    if (route.url.startsWith('/api/')) sharedRoutes.push(route as RouteOptions)
+  })
 
   await app.register(cors, {
     origin: config.WEB_ORIGIN,
@@ -47,17 +57,24 @@ export async function buildApp() {
   })
 
   app.addHook('onRequest', async (request, reply) => {
-    const path = (request.raw.url ?? '').split('?')[0]
+    const path = request.routeOptions.url ?? (request.raw.url ?? '').split('?')[0]
     if (request.method === 'OPTIONS' || path === '/health' || path === '/auth/login' || path === '/internal/dispatch') {
       return
     }
 
     if (path.startsWith('/api/')) {
       try {
-        await request.jwtVerify()
+        const payload = await request.jwtVerify<{ role?: string }>()
+        if (payload.role !== 'admin') return reply.code(401).send({ message: 'Token admin tidak valid' })
       } catch {
         return reply.code(401).send({ message: 'Sesi admin tidak valid atau sudah berakhir' })
       }
+    }
+    if (path.startsWith('/integration/')) {
+      const admin = Boolean(config.SID_ADMIN_API_KEY && safeSecretEqual(request.headers.authorization, `Bearer ${config.SID_ADMIN_API_KEY}`))
+      const operator = Boolean(config.SID_OPERATOR_API_KEY && safeSecretEqual(request.headers.authorization, `Bearer ${config.SID_OPERATOR_API_KEY}`))
+      if (!admin && !operator) return reply.code(401).send({ message: 'Key integrasi tidak valid' })
+      if (!admin && /\/whatsapp\/(connect|disconnect|qr)$/.test(path)) return reply.code(403).send({ message: 'Pengelolaan koneksi hanya untuk admin' })
     }
   })
 
@@ -69,6 +86,29 @@ export async function buildApp() {
   await registerWhatsappRoutes(app, whatsapp)
   await registerDashboardRoutes(app, whatsapp)
   await registerInternalRoutes(app, whatsapp)
+  // Reuse the exact domain handlers; only list representation differs for SID.
+  registerIntegrationRoutes(app, sharedRoutes.map((route) => {
+    const resource = route.url.match(/^\/api\/(contacts|templates|campaigns|messages)$/)?.[1]
+    return resource && route.method === 'GET' ? { ...route, handler: integrationListHandler(resource) } : route
+  }))
+
+  app.addHook('onSend', async (request, _reply, payload) => {
+    if (typeof payload === 'string' && ['POST', 'PATCH', 'DELETE'].includes(request.method)) {
+      try { const value = JSON.parse(payload) as { id?: string }; if (typeof value.id === 'string') auditedObjects.set(request, value.id.slice(0, 80)) } catch { /* Non-JSON responses have no object ID. */ }
+    }
+    if (request.routeOptions.url?.startsWith('/integration/') && typeof payload === 'string' && !safeSecretEqual(request.headers.authorization, `Bearer ${config.SID_ADMIN_API_KEY}`)) {
+      return payload.replace(/"qrDataUrl":(?:"(?:[^"\\]|\\.)*"|null)/g, '"qrDataUrl":null')
+    }
+    return payload
+  })
+  app.addHook('onResponse', async (request, reply) => {
+    if (!['POST', 'PATCH', 'DELETE'].includes(request.method) || !/^\/(api|integration)\//.test(request.url) || request.url.includes('/preview')) return
+    const path = request.url.split('?')[0]
+    const params = request.params as { id?: string; key?: string }
+    const actor = typeof request.headers['x-sid-actor-id'] === 'string' && path.startsWith('/integration/') ? request.headers['x-sid-actor-id'].slice(0, 80) : (request.user as { username?: string } | undefined)?.username ?? 'admin'
+    try { await db.insert(messagingAudit).values({ id: randomUUID(), actor, source: path.startsWith('/integration/') ? 'siddes' : 'react', action: `${request.method} ${request.routeOptions.url}`, objectId: params?.id ?? auditedObjects.get(request) ?? (path.includes('/whatsapp/') ? 'default' : null), result: reply.statusCode }) }
+    catch { app.log.error('Audit messaging tidak dapat dipersist') }
+  })
 
   app.setErrorHandler((error, _request, reply) => {
     if (error instanceof ZodError) {
@@ -85,16 +125,16 @@ export async function buildApp() {
     if (httpError.statusCode && httpError.statusCode < 500) {
       return reply.code(httpError.statusCode).send({ message: httpError.message ?? 'Request tidak valid' })
     }
-    app.log.error(error)
+    app.log.error({ code: databaseCode ?? 'INTERNAL_ERROR' }, 'Request gagal; detail sensitif tidak dicatat')
     return reply.code(500).send({ message: 'Terjadi kesalahan pada server' })
   })
 
   app.addHook('onReady', async () => {
-    whatsapp.restore().catch((error) => app.log.warn({ err: error }, 'WhatsApp session belum dapat direstore'))
+    if (options.restore !== false && whatsapp instanceof BaileysProvider) whatsapp.restore().catch(() => app.log.warn('WhatsApp session belum dapat direstore'))
   })
 
-  app.addHook('onClose', async () => {
-    await whatsapp.shutdown()
+  app.addHook('preClose', async () => {
+    if (whatsapp instanceof BaileysProvider) await whatsapp.shutdown()
   })
 
   return app

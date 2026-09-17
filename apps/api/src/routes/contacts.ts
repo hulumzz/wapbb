@@ -10,7 +10,7 @@ import { normalizeIndonesianPhone } from '../utils/phone.js'
 const contactInput = z.object({
   fullName: z.string().trim().min(2).max(120),
   phone: z.string().trim().min(8).max(30),
-  whatsappOptIn: z.boolean().default(true),
+  whatsappOptIn: z.boolean().default(false),
 })
 
 const contactImportInput = z.object({
@@ -23,6 +23,11 @@ const contactImportInput = z.object({
 })
 
 export async function registerContactRoutes(app: FastifyInstance) {
+  app.get('/api/contacts/:id', async (request, reply) => {
+    const { id } = z.object({ id: z.string().uuid() }).parse(request.params)
+    const [contact] = await db.select().from(contacts).where(eq(contacts.id, id)).limit(1)
+    return contact ?? reply.code(404).send({ message: 'Kontak tidak ditemukan' })
+  })
   app.get('/api/contacts', async (request) => {
     const query = z.object({ search: z.string().optional() }).parse(request.query)
     const search = query.search?.trim()
