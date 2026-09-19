@@ -100,6 +100,8 @@ CONNECTED
 
 QR baru hanya diperlukan ketika akun benar-benar logout, perangkat dihapus, atau session sudah tidak valid.
 
+Tombol **Hentikan koneksi** hanya menutup koneksi sementara dan mempertahankan session. Gunakan **Ganti akun WhatsApp** untuk menghapus session lama dan membuat QR baru. Pergantian akun ditolak selama masih ada campaign berstatus `RUNNING`; jeda atau batalkan campaign tersebut terlebih dahulu.
+
 ## Dispatcher
 
 Message tidak dikirim memakai proses `sleep()` panjang. Campaign menghasilkan queue di PostgreSQL. Scheduler eksternal memanggil `POST /internal/dispatch`, lalu dispatcher mengambil maksimal satu batch job yang eligible secara atomic dengan `FOR UPDATE SKIP LOCKED` dan processing token.

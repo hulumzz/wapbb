@@ -216,6 +216,7 @@ td strong { color: var(--ink); }
 .connection-card > h2 { font-size: 18px; }
 .connection-card > p:not(.section-kicker) { margin: 6px 0 16px; color: var(--muted); font-size: 9px; }
 .connection-facts { margin: 0 0 13px; text-align: left; }
+.connection-actions { display: grid; gap: 7px; }
 .connection-actions button { width: 100%; }
 .qr-card { min-height: 395px; }
 .qr { width: 265px; max-width: 100%; display: block; margin: 25px auto 0; padding: 8px; background: #fff; border: 1px solid var(--line); border-radius: 12px; }

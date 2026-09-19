@@ -53,6 +53,7 @@ export class MessagingProviderError extends Error {
 export interface MessagingProvider {
   connect(): Promise<void>
   disconnect(): Promise<void>
+  replaceAccount(): Promise<void>
   getStatus(): Promise<MessagingState>
   sendText(input: SendTextInput): Promise<SendResult>
   sendImage(input: SendImageInput): Promise<SendResult>

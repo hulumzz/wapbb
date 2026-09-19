@@ -74,7 +74,7 @@ export async function buildApp(options: { provider?: MessagingProvider; restore?
       const admin = Boolean(config.SID_ADMIN_API_KEY && safeSecretEqual(request.headers.authorization, `Bearer ${config.SID_ADMIN_API_KEY}`))
       const operator = Boolean(config.SID_OPERATOR_API_KEY && safeSecretEqual(request.headers.authorization, `Bearer ${config.SID_OPERATOR_API_KEY}`))
       if (!admin && !operator) return reply.code(401).send({ message: 'Key integrasi tidak valid' })
-      if (!admin && /\/whatsapp\/(connect|disconnect|qr)$/.test(path)) return reply.code(403).send({ message: 'Pengelolaan koneksi hanya untuk admin' })
+      if (!admin && /\/whatsapp\/(connect|disconnect|replace-account|qr)$/.test(path)) return reply.code(403).send({ message: 'Pengelolaan koneksi hanya untuk admin' })
     }
   })
 

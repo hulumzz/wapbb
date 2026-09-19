@@ -11,11 +11,12 @@ import { MessagingProviderError, type SendTextInput } from '../providers/whatsap
 let postgres: EmbeddedPostgres, app: FastifyInstance
 let database: typeof import('./client.js')
 let sends = 0
+let accountReplacements = 0
 let onSend: ((input: SendTextInput) => Promise<void>) | null = null
 const operatorKey = 'integration-operator-test-key-00000000', adminKey = 'integration-admin-test-key-00000000000'
 const headers = { authorization: `Bearer ${operatorKey}` }
 const provider = {
-  connect: async () => {}, disconnect: async () => {},
+  connect: async () => {}, disconnect: async () => {}, replaceAccount: async () => { accountReplacements++ },
   getStatus: async () => ({ status: 'CONNECTED' as const, phoneNumber: '628123456789', qrDataUrl: 'data:image/png;base64,test' }),
   sendText: async (input: SendTextInput) => { await onSend?.(input); await input.beforeRelay?.(); sends++; return { providerMessageId: 'fake' } },
   sendImage: async () => ({ providerMessageId: 'fake' }),
@@ -38,7 +39,7 @@ before(async () => {
   assert.equal((await fetch(`${address}/health`)).status, 200)
 })
 after(async () => { await app?.close(); await database?.pool.end(); await postgres?.stop().catch((error: NodeJS.ErrnoException) => { if (error.code !== 'EBUSY') throw error }) })
-beforeEach(async () => { sends = 0; onSend = null; await database.pool.query('TRUNCATE contacts, campaigns, message_templates, messaging_leases, messaging_audit CASCADE') })
+beforeEach(async () => { sends = 0; accountReplacements = 0; onSend = null; await database.pool.query('TRUNCATE contacts, campaigns, message_templates, messaging_leases, messaging_audit CASCADE') })
 async function contact() {
   const response = await app.inject({ method: 'POST', url: '/integration/v1/contacts', headers, payload: { fullName: 'Perwakilan Rumah', phone: '081234567890', whatsappOptIn: true } })
   assert.equal(response.statusCode, 201); return response.json().id as string
@@ -57,7 +58,10 @@ const dispatch = () => app.inject({ method: 'POST', url: '/internal/dispatch', h
 test('scopes, JWT separation, QR redaction and pagination', async () => {
   assert.equal((await app.inject('/integration/v1/contacts')).statusCode, 401)
   assert.equal((await app.inject({ method: 'POST', url: '/integration/v1/whatsapp/connect', headers })).statusCode, 403)
+  assert.equal((await app.inject({ method: 'POST', url: '/integration/v1/whatsapp/replace-account', headers })).statusCode, 403)
   assert.equal((await app.inject({ method: 'POST', url: '/integration/v1/whatsapp/connect', headers: { authorization: `Bearer ${adminKey}` } })).statusCode, 200)
+  assert.equal((await app.inject({ method: 'POST', url: '/integration/v1/whatsapp/replace-account', headers: { authorization: `Bearer ${adminKey}` } })).statusCode, 200)
+  assert.equal(accountReplacements, 1)
   assert.equal((await app.inject({ url: '/integration/v1/whatsapp/status', headers })).json().qrDataUrl, null)
   assert.equal((await app.inject({ url: '/api/messages', headers })).statusCode, 401)
   const token = app.jwt.sign({ kind: 'campaign-preview' })
@@ -65,6 +69,15 @@ test('scopes, JWT separation, QR redaction and pagination', async () => {
   await contact()
   const page = await app.inject({ url: '/integration/v1/contacts?perPage=1', headers })
   assert.equal(page.json().pagination.total, 1); assert.equal(page.json().items.length, 1)
+})
+
+test('account replacement is blocked while a campaign is running', async () => {
+  const d = await draft()
+  await database.pool.query("UPDATE campaigns SET status='RUNNING' WHERE id=$1", [d.id])
+  const response = await app.inject({ method: 'POST', url: '/integration/v1/whatsapp/replace-account', headers: { authorization: `Bearer ${adminKey}` } })
+  assert.equal(response.statusCode, 409)
+  assert.match(response.json().message, /campaign yang sedang berjalan/)
+  assert.equal(accountReplacements, 0)
 })
 test('direct content snapshot and idempotent replay after preview expires', async () => {
   const d = await draft()
@@ -156,6 +169,35 @@ test('retired session owner cannot write or delete a new owner auth-state', asyn
   await releaseLease('whatsapp:lease-auth', 'old'); await acquireLease('whatsapp:lease-auth', 'new')
   await assert.rejects(old.saveCreds()); await assert.rejects(old.clear())
   assert.equal((await database.pool.query("SELECT count(*)::int AS count FROM whatsapp_auth WHERE account_id='lease-auth'")).rows[0].count, 1)
+})
+
+test('account replacement clears the old persisted session before requesting a new QR', async () => {
+  const { BaileysProvider } = await import('../providers/whatsapp/baileys.provider.js')
+  const { createSqlAuthState } = await import('../providers/whatsapp/sql-auth-state.js')
+  const { acquireLease } = await import('../utils/lease.js')
+  const owner = randomUUID()
+  await database.pool.query("DELETE FROM whatsapp_auth WHERE account_id='default'; INSERT INTO whatsapp_accounts (id,status,phone_number) VALUES ('default','CONNECTED','628123456789') ON CONFLICT (id) DO UPDATE SET status='CONNECTED', phone_number='628123456789'")
+  assert.equal(await acquireLease('whatsapp:default', owner), true)
+  const auth = await createSqlAuthState('default', owner)
+  await auth.saveCreds()
+
+  let reconnects = 0
+  const instance = new BaileysProvider()
+  Object.assign(instance, {
+    owner,
+    clearAuth: auth.clear,
+    flushAuth: auth.flush,
+    socket: { end: () => undefined },
+    state: { status: 'CONNECTED', phoneNumber: '628123456789', qrDataUrl: null },
+    connect: async () => { reconnects++ },
+  })
+  await instance.replaceAccount()
+
+  assert.equal((await database.pool.query("SELECT count(*)::int AS count FROM whatsapp_auth WHERE account_id='default'")).rows[0].count, 0)
+  const account = (await database.pool.query("SELECT status, phone_number FROM whatsapp_accounts WHERE id='default'")).rows[0]
+  assert.deepEqual(account, { status: 'DISCONNECTED', phone_number: null })
+  assert.equal((await instance.getStatus()).phoneNumber, null)
+  assert.equal(reconnects, 1)
 })
 
 test('old attempt receipt cannot mark new retry delivered; receipts never move backwards', async () => {

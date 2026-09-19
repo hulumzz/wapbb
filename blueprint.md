@@ -595,6 +595,7 @@ GET /api/messages/:id
 GET  /api/whatsapp/status
 POST /api/whatsapp/connect
 POST /api/whatsapp/disconnect
+POST /api/whatsapp/replace-account
 GET  /api/whatsapp/qr
 ```
 
@@ -734,7 +735,7 @@ Messaging engine V1 kini menggunakan keputusan operasional berikut:
 
 - Schema dikelola dengan migration SQL versioned di `apps/api/drizzle/`; `db:push` bukan lagi alur deployment utama. Render menjalankan migration terkompilasi sebelum API start. Koneksi memakai driver `pg`/Drizzle; `sslmode=require` dari URL Neon dinormalisasi runtime menjadi `verify-full` untuk mempertahankan verifikasi sertifikat pada versi driver mendatang.
 - Auth-state Baileys disimpan per akun/key di tabel `whatsapp_auth`, dienkripsi AES-256-GCM, dan ciphertext versi baru memakai AAD `accountId:key`. Pembacaan payload lama tanpa field versi tetap didukung. Update sekumpulan Signal keys dijalankan dalam transaksi database.
-- Disconnect manual tidak menghapus session. Event logout, bad session, atau multidevice mismatch menghapus auth-state rusak agar connect berikutnya dapat menghasilkan QR baru. Reconnect transient memakai exponential backoff sampai 60 detik.
+- Disconnect manual tidak menghapus session. Aksi ganti akun khusus admin ditolak saat campaign masih `RUNNING`, lalu menghentikan socket, menghapus auth-state lama, membersihkan nomor akun, dan memulai koneksi baru agar QR baru tersedia. Event logout, bad session, atau multidevice mismatch juga menghapus auth-state rusak. Reconnect transient memakai exponential backoff sampai 60 detik.
 - Campaign UI sudah mendukung pemilihan kontak aktif yang opt-in dan preview server-side. Preview menampilkan jumlah penerima serta maksimal tiga snapshot pesan sebelum konfirmasi pembuatan draft.
 - Import kontak CSV/XLSX sudah tersedia melalui UI. XLSX dibaca secara lazy di browser, server memvalidasi ulang maksimal 1.000 baris, nomor dinormalisasi, dan konflik nomor dilewati secara aman. UI juga menampilkan preview dan ringkasan berhasil/duplikat/invalid.
 - Dashboard, daftar campaign, dan riwayat kini mempunyai refresh berkala/umpan balik proses. Campaign menampilkan progres terkirim/antre/gagal; riwayat dapat dicari dan difilter; aksi final meminta konfirmasi.
@@ -767,7 +768,7 @@ Keputusan terbaru menggantikan rencana sync konteks PBB pada Phase 6: Laravel SI
 
 `/integration/v1` memakai handler bisnis yang sama dengan `/api/*`. Dua bearer key environment terpisah minimal 32 karakter: `SID_OPERATOR_API_KEY` untuk operasional dan `SID_ADMIN_API_KEY` untuk operasional+koneksi/QR. Key integrasi tidak berlaku untuk login JWT atau dispatcher; preview JWT tidak berlaku untuk API admin. Key kosong menonaktifkan scope tersebut. QR disensor pada respons operator termasuk dashboard/status.
 
-Resource: `dashboard`, `contacts` (detail/mutation/import), `templates`, `campaigns/settings`, `campaigns/preview`, `campaigns` (detail/start/pause/resume/cancel), `campaigns/by-request/:uuid`, `messages` (detail/retry), dan `whatsapp/status|qr|connect|disconnect`. List integrasi memakai envelope `{items,pagination:{page,perPage,total,lastPage}}`, default 20/max100, pencarian/filter server-side.
+Resource: `dashboard`, `contacts` (detail/mutation/import), `templates`, `campaigns/settings`, `campaigns/preview`, `campaigns` (detail/start/pause/resume/cancel), `campaigns/by-request/:uuid`, `messages` (detail/retry), dan `whatsapp/status|qr|connect|disconnect|replace-account`. List integrasi memakai envelope `{items,pagination:{page,perPage,total,lastPage}}`, default 20/max100, pencarian/filter server-side.
 
 Campaign integrasi menerima `name`, `content` final maksimal4000, `templateId` optional, `contactIds` eksplisit 1–1000, `batchSize`, `useBanner`, `useInteractiveCta`. Template referensi tidak diubah saat content diedit. Preview mengembalikan sample, jumlah target, pilihan media/CTA dan `previewToken` signed 15 menit yang mengikat payload, konfigurasi media dan versi data penerima. Create wajib previewToken + UUID `Idempotency-Key`; replay sukses dilakukan sebelum cek expiry token. Payload/key berbeda ditolak409; perubahan penerima mewajibkan preview ulang. Lookup UUID dipakai untuk rekonsiliasi timeout.
 

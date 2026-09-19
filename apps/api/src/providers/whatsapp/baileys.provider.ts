@@ -34,6 +34,7 @@ export class BaileysProvider implements MessagingProvider {
   private readonly owner = randomUUID()
   private leaseTimer: NodeJS.Timeout | null = null
   private flushAuth: (() => Promise<void>) | null = null
+  private clearAuth: (() => Promise<void>) | null = null
   private authCleanup: Promise<void> = Promise.resolve()
   private authPersistence: 'healthy' | 'degraded' = 'healthy'
   private reason: string | null = null
@@ -108,6 +109,7 @@ export class BaileysProvider implements MessagingProvider {
     if (resetInvalidAuth) await clearStoredAuthState(ACCOUNT_ID)
     const { state, saveCreds, clear, flush } = await createSqlAuthState(ACCOUNT_ID, this.owner)
     this.authPersistence = 'healthy'
+    this.clearAuth = clear
     const setKeys = state.keys.set.bind(state.keys)
     state.keys.set = async (keys) => {
       try { await setKeys(keys) }
@@ -215,6 +217,54 @@ export class BaileysProvider implements MessagingProvider {
   async disconnect(): Promise<void> {
     await this.shutdown()
     await this.persistStatus('DISCONNECTED')
+  }
+
+  async replaceAccount(): Promise<void> {
+    this.manualDisconnect = true
+    this.reconnectAttempt = 0
+    if (this.reconnectTimer) {
+      clearTimeout(this.reconnectTimer)
+      this.reconnectTimer = null
+    }
+    if (this.connecting) await this.connecting
+    await this.authCleanup
+
+    const socket = this.socket
+    this.socket = null
+    socket?.end(undefined)
+    if (this.leaseTimer) clearInterval(this.leaseTimer)
+    this.leaseTimer = null
+
+    const ownsLease = await acquireLease('whatsapp:default', this.owner)
+    if (!ownsLease) {
+      this.reason = 'SESSION_IN_USE'
+      throw Object.assign(new MessagingProviderError('Session WhatsApp sedang digunakan proses lain', 'SESSION_IN_USE', true), { statusCode: 409 })
+    }
+
+    try {
+      if (this.clearAuth) await this.clearAuth()
+      else await clearStoredAuthState(ACCOUNT_ID)
+    } finally {
+      await releaseLease('whatsapp:default', this.owner).catch(() => undefined)
+    }
+
+    this.clearAuth = null
+    this.flushAuth = null
+    this.authCleanup = Promise.resolve()
+    this.authPersistence = 'healthy'
+    this.reason = 'ACCOUNT_REPLACED'
+    this.changedAt = new Date().toISOString()
+    this.state = { status: 'DISCONNECTED', phoneNumber: null, qrDataUrl: null }
+    await this.ensureAccount()
+    await db.update(whatsappAccounts).set({
+      status: 'DISCONNECTED',
+      phoneNumber: null,
+      connectedAt: null,
+      lastSeenAt: null,
+      updatedAt: new Date(),
+    }).where(eq(whatsappAccounts.id, ACCOUNT_ID))
+
+    await this.connect()
   }
 
   async shutdown(): Promise<void> {
