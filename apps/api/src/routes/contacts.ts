@@ -15,10 +15,11 @@ const contactInput = z.object({
 
 const contactImportInput = z.object({
   rows: z.array(z.object({
+    sheetName: z.string().trim().min(1).max(100).optional(),
     rowNumber: z.number().int().min(1),
     fullName: z.string().max(500),
     phone: z.string().max(100),
-    whatsappOptIn: z.boolean().default(false),
+    whatsappOptIn: z.boolean().default(true),
   })).min(1).max(1000),
 })
 
@@ -75,6 +76,7 @@ export async function registerContactRoutes(app: FastifyInstance) {
       imported: inserted.length,
       duplicates: prepared.duplicateWithinFile + duplicatesInDatabase,
       invalid: prepared.invalid,
+      skipped: prepared.skipped,
       issues: prepared.issues,
     })
   })

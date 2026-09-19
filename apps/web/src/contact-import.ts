@@ -1,8 +1,15 @@
 export type ContactImportRow = {
+  sheetName?: string
   rowNumber: number
   fullName: string
   phone: string
   whatsappOptIn: boolean
+}
+
+export type ContactImportParseResult = {
+  rows: ContactImportRow[]
+  skipped: number
+  sheetNames: string[]
 }
 
 type Cell = string | number | boolean | Date | typeof Date | null | undefined
@@ -27,7 +34,13 @@ function cellText(value: Cell) {
 
 function optInValue(value: Cell) {
   const normalized = normalizeHeader(value)
+  if (!normalized) return true
+  if (['tidak', 'no', 'false', '0', 'tidak setuju', 'menolak', 'opt out', 'optout'].includes(normalized)) return false
   return ['ya', 'yes', 'true', '1', 'setuju', 'bersedia', 'opt in', 'optin'].includes(normalized)
+}
+
+function phoneDigitCount(value: string) {
+  return value.replace(/\D/g, '').length
 }
 
 function detectDelimiter(text: string) {
@@ -79,40 +92,90 @@ export function parseCsv(text: string): string[][] {
   return rows
 }
 
-export function mapContactRows(rows: Cell[][]): ContactImportRow[] {
+function headerIndexes(rows: Cell[][]) {
+  const headers = (rows[0] ?? []).map(normalizeHeader)
+  return {
+    nameIndex: headers.findIndex((header) => NAME_HEADERS.has(header)),
+    phoneIndex: headers.findIndex((header) => PHONE_HEADERS.has(header)),
+    optInIndex: headers.findIndex((header) => OPT_IN_HEADERS.has(header)),
+  }
+}
+
+function mapRows(rows: Cell[][], sheetName?: string) {
   if (!rows.length) throw new Error('File tidak berisi data.')
-  const headers = rows[0].map(normalizeHeader)
-  const nameIndex = headers.findIndex((header) => NAME_HEADERS.has(header))
-  const phoneIndex = headers.findIndex((header) => PHONE_HEADERS.has(header))
-  const optInIndex = headers.findIndex((header) => OPT_IN_HEADERS.has(header))
+  const { nameIndex, phoneIndex, optInIndex } = headerIndexes(rows)
 
   if (nameIndex < 0 || phoneIndex < 0) {
     throw new Error('Header wajib tidak ditemukan. Gunakan kolom "Nama Lengkap" dan "Nomor WhatsApp".')
   }
 
+  let skipped = 0
+  let sourceRows = 0
   const result = rows.slice(1).flatMap((row, index) => {
+    if (!row.some((cell) => cellText(cell))) return []
+    sourceRows += 1
     const fullName = cellText(row[nameIndex])
     const phone = cellText(row[phoneIndex])
-    if (!fullName && !phone) return []
+    const digitCount = phoneDigitCount(phone)
+    if (!fullName || !phone || digitCount < 10 || digitCount > 14) {
+      skipped += 1
+      return []
+    }
     return [{
+      sheetName,
       rowNumber: index + 2,
       fullName,
       phone,
-      whatsappOptIn: optInIndex < 0 ? false : optInValue(row[optInIndex]),
+      whatsappOptIn: optInIndex < 0 ? true : optInValue(row[optInIndex]),
     }]
   })
 
-  if (!result.length) throw new Error('Tidak ada baris kontak di bawah header.')
-  if (result.length > 1000) throw new Error('Maksimal 1.000 baris per file impor.')
-  return result
+  return { rows: result, skipped, sourceRows }
 }
 
-export async function parseContactFile(file: File) {
+export function mapContactRows(rows: Cell[][]): ContactImportRow[] {
+  const result = mapRows(rows)
+
+  if (result.sourceRows > 1000) throw new Error('Maksimal 1.000 baris per file impor.')
+  if (!result.rows.length) throw new Error('Tidak ada baris dengan nama dan nomor WhatsApp yang valid.')
+  return result.rows
+}
+
+export function mapContactSheets(sheets: Array<{ sheet: string; data: Cell[][] }>): ContactImportParseResult {
+  const contactSheets = sheets.filter(({ data }) => {
+    const { nameIndex, phoneIndex } = headerIndexes(data)
+    return nameIndex >= 0 && phoneIndex >= 0
+  })
+
+  if (!contactSheets.length) {
+    throw new Error('Tidak ada sheet dengan header "Nama Lengkap" dan "Nomor WhatsApp".')
+  }
+
+  const mapped = contactSheets.map(({ sheet, data }) => mapRows(data, sheet))
+  const sourceRows = mapped.reduce((total, item) => total + item.sourceRows, 0)
+  const rows = mapped.flatMap((item) => item.rows)
+  if (sourceRows > 1000) throw new Error('Maksimal 1.000 baris untuk total seluruh sheet kontak.')
+  if (!rows.length) throw new Error('Tidak ada baris dengan nama dan nomor WhatsApp yang valid.')
+
+  return {
+    rows,
+    skipped: mapped.reduce((total, item) => total + item.skipped, 0),
+    sheetNames: contactSheets.map(({ sheet }) => sheet),
+  }
+}
+
+export async function parseContactFile(file: File): Promise<ContactImportParseResult> {
   const extension = file.name.split('.').pop()?.toLowerCase()
-  if (extension === 'csv') return mapContactRows(parseCsv(await file.text()))
+  if (extension === 'csv') {
+    const parsed = parseCsv(await file.text())
+    const mapped = mapRows(parsed)
+    if (mapped.sourceRows > 1000) throw new Error('Maksimal 1.000 baris per file impor.')
+    if (!mapped.rows.length) throw new Error('Tidak ada baris dengan nama dan nomor WhatsApp yang valid.')
+    return { rows: mapped.rows, skipped: mapped.skipped, sheetNames: [] }
+  }
   if (extension === 'xlsx') {
-    const { readSheet } = await import('read-excel-file/browser')
-    return mapContactRows(await readSheet(file))
+    const { default: readExcelFile } = await import('read-excel-file/browser')
+    return mapContactSheets(await readExcelFile(file))
   }
   throw new Error('Format belum didukung. Pilih file .csv atau .xlsx.')
 }

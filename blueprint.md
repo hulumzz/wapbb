@@ -367,9 +367,11 @@ Fitur:
 
 Kontrak import V1:
 
-- maksimal 1.000 baris dan 5 MB per file pada UI;
+- maksimal total 1.000 baris dan 5 MB per file pada UI;
 - header wajib `Nama Lengkap` dan `Nomor WhatsApp`, sedangkan `Opt In` opsional;
-- nilai opt-in yang hilang/tidak eksplisit diperlakukan sebagai opt-out agar import tidak memberikan persetujuan secara implisit;
+- baris tanpa nama, tanpa nomor, atau dengan jumlah digit nomor di luar 10-14 dilewati;
+- nilai opt-in yang kosong atau kolomnya tidak tersedia diperlakukan sebagai opt-in; operator wajib memastikan file hanya memuat penerima yang sudah memberikan persetujuan;
+- seluruh sheet XLSX yang memiliki kedua header wajib digabung, sedangkan sheet tanpa header kontak diabaikan;
 - parsing CSV/XLSX dan preview dilakukan di browser, tetapi validasi serta normalisasi server tetap menjadi sumber kebenaran;
 - nomor duplikat dalam file atau yang sudah ada di database dilewati, bukan ditimpa;
 - baris invalid tidak menggagalkan seluruh file dan harus dilaporkan dengan nomor barisnya.

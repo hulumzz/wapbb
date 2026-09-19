@@ -57,9 +57,9 @@ Login menggunakan nilai `ADMIN_USERNAME` dan `ADMIN_PASSWORD` dari environment.
 
 ### Impor kontak
 
-Menu Kontak menerima file `.csv` dan `.xlsx` sampai 1.000 baris atau 5 MB. Baris pertama harus memuat kolom `Nama Lengkap` dan `Nomor WhatsApp`; kolom `Opt In` opsional. Bila nilai opt-in tidak tersedia atau tidak eksplisit, kontak disimpan sebagai opt-out dan tidak eligible untuk campaign. Format header umum seperti `nama`, `phone`, dan `no whatsapp` juga dikenali.
+Menu Kontak menerima file `.csv` dan `.xlsx` sampai total 1.000 baris atau 5 MB. Baris pertama harus memuat kolom `Nama Lengkap` dan `Nomor WhatsApp`; kolom `Opt In` opsional. Bila nilai opt-in kosong atau kolomnya tidak tersedia, kontak disimpan sebagai opt-in. Pastikan file hanya memuat penerima yang memang sudah memberikan persetujuan. Format header umum seperti `nama`, `phone`, dan `no whatsapp` juga dikenali.
 
-File dibaca dan dipreview di browser, kemudian server tetap melakukan validasi dan normalisasi nomor Indonesia. Baris invalid dilewati dengan laporan nomor baris, sedangkan nomor duplikat di file maupun database tidak ditambahkan ulang.
+File dibaca dan dipreview di browser, kemudian server tetap melakukan validasi dan normalisasi nomor Indonesia. Baris tanpa nama, tanpa nomor, atau dengan nomor di luar 10-14 digit dilewati. Untuk XLSX, seluruh sheet yang memiliki kedua header wajib digabung; sheet petunjuk atau sheet lain tanpa header kontak diabaikan. Nomor duplikat di file maupun database tidak ditambahkan ulang.
 
 ## Endpoint utama
 

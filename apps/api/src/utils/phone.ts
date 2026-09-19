@@ -3,6 +3,11 @@ export class PhoneValidationError extends Error {
 }
 
 export function normalizeIndonesianPhone(input: string): string {
+  const digitCount = input.replace(/\D/g, '').length
+  if (digitCount < 10 || digitCount > 14) {
+    throw new PhoneValidationError('Nomor WhatsApp harus berisi 10-14 digit.')
+  }
+
   let phone = input.trim().replace(/[\s\-().]/g, '')
 
   if (phone.startsWith('+')) phone = phone.slice(1)
