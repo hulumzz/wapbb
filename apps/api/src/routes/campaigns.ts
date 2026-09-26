@@ -4,10 +4,11 @@ import { and, desc, eq, getTableColumns, inArray, sql } from 'drizzle-orm'
 import { z } from 'zod'
 import { config } from '../config.js'
 import { db } from '../db/client.js'
-import { campaignRecipients, campaigns, contacts, messageJobs, messageTemplates } from '../db/schema.js'
+import { campaignRecipients, campaigns, contacts, messageJobs, messageTemplates, whatsappAccounts } from '../db/schema.js'
 import { createCampaignRequestHash } from '../utils/campaign-idempotency.js'
 import { extractHttpsUrl } from '../utils/message-link.js'
 import { renderMessageTemplate } from '../utils/template.js'
+import { isDeliveryHeld } from '../services/delivery-safety.js'
 
 const createCampaign = z.object({
   name: z.string().trim().min(2).max(120),
@@ -261,10 +262,28 @@ function validateInteractiveCta(input: CampaignInput, templateContent: string, r
 
 async function updateStatus(paramsInput: unknown, reply: FastifyReply, status: string, from: string[], extra: Record<string, unknown> = {}) {
   const params = z.object({ id: z.string().uuid() }).parse(paramsInput)
-  const [updated] = await db.update(campaigns).set({ status, ...extra, updatedAt: new Date() }).where(and(
-    eq(campaigns.id, params.id),
-    inArray(campaigns.status, from),
-  )).returning()
+  if (status === 'RUNNING' && await isDeliveryHeld()) return reply.code(409).send({ message: 'Pengiriman WhatsApp dijeda karena risiko. Tinjau status keamanan sebelum melanjutkan campaign.' })
+  const result = await db.transaction(async (tx) => {
+    if (status === 'RUNNING') {
+      await tx.execute(sql`SELECT pg_advisory_xact_lock(713845210)`)
+      const [target] = await tx.select({ status: campaigns.status, senderPhone: campaigns.senderPhone }).from(campaigns).where(eq(campaigns.id, params.id)).limit(1)
+      const [account] = await tx.select({ phoneNumber: whatsappAccounts.phoneNumber }).from(whatsappAccounts).where(eq(whatsappAccounts.id, 'default')).limit(1)
+      if (target && !account?.phoneNumber) return { error: 'Hubungkan akun WhatsApp sebelum menjalankan campaign.' }
+      if (target?.senderPhone && target.senderPhone !== account?.phoneNumber) return { error: 'Campaign ini dibuat untuk nomor WhatsApp lain. Buat campaign baru untuk akun saat ini.' }
+      if (target?.status === 'PAUSED' && config.WA_SAFETY_ENABLED && !target.senderPhone) return { error: 'Nomor pengirim campaign lama belum tercatat. Tinjau dan buat campaign baru.' }
+      const [active] = await tx.select({ id: campaigns.id, name: campaigns.name }).from(campaigns).where(and(eq(campaigns.status, 'RUNNING'), sql`${campaigns.id} <> ${params.id}`)).limit(1)
+      if (active) return { active }
+      if (target?.status === 'DRAFT' && account?.phoneNumber) extra = { ...extra, senderPhone: account.phoneNumber }
+    }
+    const [updated] = await tx.update(campaigns).set({ status, ...extra, updatedAt: new Date() }).where(and(
+      eq(campaigns.id, params.id),
+      inArray(campaigns.status, from),
+    )).returning()
+    return { updated }
+  })
+  if (result.error) return reply.code(409).send({ message: result.error })
+  if (result.active) return reply.code(409).send({ message: `Campaign ${result.active.name} sedang berjalan. Jeda atau selesaikan campaign tersebut terlebih dahulu.`, activeCampaignId: result.active.id })
+  const updated = result.updated
   if (!updated) return reply.code(409).send({ message: `Campaign tidak dapat diubah ke ${status} dari status saat ini` })
   return updated
 }

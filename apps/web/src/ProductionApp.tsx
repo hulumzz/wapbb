@@ -36,6 +36,7 @@ type Message = {
   errorMessage?: string | null
 }
 type WhatsappState = { status: string; phoneNumber: string | null; qrDataUrl: string | null }
+type DeliverySafetyState = { enabled: boolean; mode: string; holdReason: string | null; warmupDay: number; dailyLimit: number; reservedToday: number; nextAllowedAt: string | null; minDelaySeconds: number; maxDelaySeconds: number }
 type Dashboard = {
   contacts: number
   activeCampaigns: number
@@ -280,14 +281,15 @@ function CampaignsPage({ notify }: { notify: Notify }) {
   const [useBanner, setUseBanner] = useState(false)
   const [useInteractiveCta, setUseInteractiveCta] = useState(false)
   const [settings, setSettings] = useState<CampaignSettings | null>(null)
+  const [safety, setSafety] = useState<DeliverySafetyState | null>(null)
   const [preview, setPreview] = useState<CampaignPreview | null>(null)
   const [idempotencyKey, setIdempotencyKey] = useState(() => crypto.randomUUID())
   const [busy, setBusy] = useState('')
 
   const load = async () => {
-    const [campaignData, templateData, contactData, campaignSettings] = await Promise.all([api<Campaign[]>('/api/campaigns'), api<Template[]>('/api/templates'), api<Contact[]>('/api/contacts'), api<CampaignSettings>('/api/campaigns/settings')])
+    const [campaignData, templateData, contactData, campaignSettings, safetyStatus] = await Promise.all([api<Campaign[]>('/api/campaigns'), api<Template[]>('/api/templates'), api<Contact[]>('/api/contacts'), api<CampaignSettings>('/api/campaigns/settings'), api<DeliverySafetyState>('/api/whatsapp/safety')])
     const eligible = contactData.filter((contact) => contact.isActive && contact.whatsappOptIn)
-    setCampaigns(campaignData); setTemplates(templateData); setContacts(eligible); setSettings(campaignSettings)
+    setCampaigns(campaignData); setTemplates(templateData); setContacts(eligible); setSettings(campaignSettings); setSafety(safetyStatus)
     setSelectedIds((current) => current.filter((id) => eligible.some((contact) => contact.id === id)))
     const firstActive = templateData.find((template) => template.isActive)
     if (!templateId && firstActive) setTemplateId(firstActive.id)
@@ -331,7 +333,7 @@ function CampaignsPage({ notify }: { notify: Notify }) {
     return <article className="campaign-card" key={campaign.id}><div className="campaign-row"><div><div className="title-line"><strong>{campaign.name}</strong><StatusBadge value={campaignStatus[campaign.status] ?? campaign.status} tone={['RUNNING', 'COMPLETED'].includes(campaign.status) ? 'success' : campaign.status === 'CANCELLED' ? 'danger' : 'neutral'} /></div><p>{formatDate(campaign.createdAt)} | Batch {campaign.batchSize} | {campaign.useBanner ? 'Banner' : 'Teks'}{campaign.useInteractiveCta ? ' + tombol' : ''}</p></div><div className="row-actions">{campaign.status === 'DRAFT' && <button disabled={!!busy} onClick={() => action(campaign.id, 'start')}>Mulai</button>}{campaign.status === 'RUNNING' && <button disabled={!!busy} onClick={() => action(campaign.id, 'pause')}>Jeda</button>}{campaign.status === 'PAUSED' && <button disabled={!!busy} onClick={() => action(campaign.id, 'resume')}>Lanjutkan</button>}{['DRAFT', 'RUNNING', 'PAUSED'].includes(campaign.status) && <button className="danger-button" disabled={!!busy} onClick={() => action(campaign.id, 'cancel')}>Batalkan</button>}</div></div><div className="campaign-progress"><div><span style={{ width: `${progress}%` }} /></div><p><strong>{campaign.sentCount}/{campaign.recipientCount} diserahkan</strong><span>{campaign.deliveredCount} terkirim | {campaign.readCount} dibaca | {campaign.failedCount} gagal</span></p></div></article>
   })}{!campaigns.length && <div className="table-empty">Belum ada campaign.</div>}</div></section>
 
-    <form className="panel side-form campaign-composer" onSubmit={create}><div className="form-title"><span className="form-icon"><Icon name="send" /></span><div><p className="section-kicker">CAMPAIGN BARU</p><h2>Siapkan pengiriman</h2></div></div><div className="form-grid"><label>Nama campaign<input required value={name} onChange={(event) => { setName(event.target.value); invalidate() }} /></label><label>Ukuran batch<input type="number" min={1} max={50} value={batchSize} onChange={(event) => { setBatchSize(Number(event.target.value)); invalidate() }} /></label></div><label>Template pesan<select required value={templateId} onChange={(event) => { setTemplateId(event.target.value); invalidate() }}><option value="">Pilih template</option>{templates.filter((template) => template.isActive).map((template) => <option key={template.id} value={template.id}>{template.name}</option>)}</select></label>
+    <form className="panel side-form campaign-composer" onSubmit={create}><div className="form-title"><span className="form-icon"><Icon name="send" /></span><div><p className="section-kicker">CAMPAIGN BARU</p><h2>Siapkan pengiriman</h2></div></div>{safety?.enabled && <p className="delivery-safety-note">{safety.mode === 'PAUSED_RISK' ? `Pengiriman dijeda: ${safety.holdReason ?? 'perlu pemeriksaan akun'}.` : `Batas hari ini: ${safety.reservedToday}/${safety.dailyLimit} slot terpakai. Jeda ${safety.minDelaySeconds}–${safety.maxDelaySeconds} detik; antrean diproses saat jadwal dispatcher berikutnya.`}</p>}<div className="form-grid"><label>Nama campaign<input required value={name} onChange={(event) => { setName(event.target.value); invalidate() }} /></label><label>Ukuran batch<input type="number" min={1} max={50} value={batchSize} onChange={(event) => { setBatchSize(Number(event.target.value)); invalidate() }} /></label></div><label>Template pesan<select required value={templateId} onChange={(event) => { setTemplateId(event.target.value); invalidate() }}><option value="">Pilih template</option>{templates.filter((template) => template.isActive).map((template) => <option key={template.id} value={template.id}>{template.name}</option>)}</select></label>
       <div className="option-grid"><label className="toggle-row"><input type="checkbox" checked={useBanner} onChange={(event) => { setUseBanner(event.target.checked); invalidate() }} /><span><strong>Gunakan banner</strong><small>Kirim gambar dengan caption.</small></span></label><label className={`toggle-row ${!settings?.interactiveCtaEnabled ? 'disabled' : ''}`}><input type="checkbox" checked={useInteractiveCta} disabled={!settings?.interactiveCtaEnabled} onChange={(event) => { setUseInteractiveCta(event.target.checked); invalidate() }} /><span><strong>Tombol tindakan</strong><small>{settings?.interactiveCtaEnabled ? 'Buka tautan langsung dari pesan.' : 'Belum diaktifkan pada server.'}</small></span></label></div>
       {useInteractiveCta && <div className={detectedUrl ? 'cta-detected' : 'inline-alert danger'}><Icon name={detectedUrl ? 'link' : 'alert'} /><span>{detectedUrl ? <><strong>{settings?.interactiveCtaLabel}</strong><small>{detectedUrl}</small></> : 'Template harus memiliki URL HTTPS.'}</span></div>}
       <fieldset className="recipient-picker"><legend>Penerima ({selectedIds.length}/{contacts.length})</legend><div className="recipient-toolbar"><div className="search-box small"><Icon name="search" /><input placeholder="Cari penerima" value={recipientSearch} onChange={(event) => setRecipientSearch(event.target.value)} /></div><div><button type="button" onClick={() => { setSelectedIds(contacts.map((contact) => contact.id)); invalidate() }}>Semua</button><button type="button" onClick={() => { setSelectedIds([]); invalidate() }}>Kosongkan</button></div></div><div className="recipient-list">{visibleContacts.map((contact) => <label className="checkbox-row" key={contact.id}><input type="checkbox" checked={selectedIds.includes(contact.id)} onChange={() => toggleContact(contact.id)} /><span>{contact.fullName}<small>+{contact.phoneNormalized}</small></span></label>)}{!visibleContacts.length && <p className="hint">Tidak ada penerima yang cocok.</p>}</div></fieldset>
@@ -366,8 +368,9 @@ function HistoryPage({ notify }: { notify: Notify }) {
 
 function WhatsappPage({ notify }: { notify: Notify }) {
   const [state, setState] = useState<WhatsappState | null>(null)
+  const [safety, setSafety] = useState<DeliverySafetyState | null>(null)
   const [busy, setBusy] = useState<'connect' | 'disconnect' | 'replace' | null>(null)
-  const load = () => api<WhatsappState>('/api/whatsapp/status').then(setState)
+  const load = async () => { const [status, safetyStatus] = await Promise.all([api<WhatsappState>('/api/whatsapp/status'), api<DeliverySafetyState>('/api/whatsapp/safety')]); setState(status); setSafety(safetyStatus) }
   useEffect(() => { void load().catch(() => undefined); const timer = window.setInterval(() => void load().catch(() => undefined), 3000); return () => window.clearInterval(timer) }, [])
   async function connect() { setBusy('connect'); try { setState(await api('/api/whatsapp/connect', { method: 'POST' })); notify('Proses koneksi WhatsApp dimulai') } catch (caught) { notify(caught instanceof Error ? caught.message : 'WhatsApp gagal dihubungkan') } finally { setBusy(null) } }
   async function disconnect() { if (!window.confirm('Hentikan koneksi WhatsApp saat ini? Session tetap tersimpan dan dapat digunakan kembali.')) return; setBusy('disconnect'); try { setState(await api('/api/whatsapp/disconnect', { method: 'POST' })); notify('Koneksi dihentikan tanpa menghapus session') } catch (caught) { notify(caught instanceof Error ? caught.message : 'Koneksi gagal dihentikan') } finally { setBusy(null) } }
@@ -380,9 +383,39 @@ function WhatsappPage({ notify }: { notify: Notify }) {
     } catch (caught) { notify(caught instanceof Error ? caught.message : 'Akun WhatsApp gagal diganti') }
     finally { setBusy(null) }
   }
+  async function resumeSafety() {
+    if (!window.confirm('Lanjutkan pengiriman setelah memeriksa status akun, persetujuan penerima, dan isi campaign?')) return
+    try { setSafety(await api<DeliverySafetyState>('/api/whatsapp/safety/resume', { method: 'POST' })); notify('Pembatasan risiko dibuka. Lanjutkan campaign secara terpisah setelah pemeriksaan.') }
+    catch (caught) { notify(caught instanceof Error ? caught.message : 'Pembatasan belum dapat dibuka') }
+  }
   const connected = state?.status === 'CONNECTED'
 
-  return <div className="whatsapp-grid"><section className="panel connection-card"><span className={`wa-icon ${connected ? 'online' : ''}`}><Icon name="message" /></span><p className="section-kicker">STATUS PERANGKAT</p><h2>{whatsappStatus[state?.status ?? ''] ?? 'Memuat status...'}</h2><p>{state?.phoneNumber ? `+${state.phoneNumber}` : 'Belum ada nomor yang terhubung'}</p><div className="connection-facts"><SystemRow label="Session persisten" text="Tersimpan terenkripsi" /><SystemRow label="Pemulihan otomatis" text="Aktif setelah restart" /></div><div className="connection-actions">{!connected ? <button className="primary" disabled={!!busy || state?.status === 'CONNECTING'} onClick={connect}>{busy === 'connect' ? 'Menghubungkan...' : 'Hubungkan WhatsApp'}</button> : <button disabled={!!busy} onClick={disconnect}>{busy === 'disconnect' ? 'Menghentikan...' : 'Hentikan koneksi'}</button>}{state?.phoneNumber && <button className="danger-button" disabled={!!busy} onClick={replaceAccount}>{busy === 'replace' ? 'Menghapus session...' : 'Ganti akun WhatsApp'}</button>}</div></section><section className="panel qr-card"><div className="panel-head"><div><h2>Hubungkan perangkat</h2><p>Buka WhatsApp Business, pilih Perangkat tertaut, lalu pindai QR.</p></div><StatusBadge value={connected ? 'Siap mengirim' : 'Belum siap'} tone={connected ? 'success' : 'neutral'} /></div>{state?.qrDataUrl ? <img className="qr" src={state.qrDataUrl} alt="QR untuk menghubungkan WhatsApp" /> : <div className={`qr-placeholder ${connected ? 'complete' : ''}`}><span><Icon name={connected ? 'check' : 'qr'} /></span><strong>{connected ? 'Perangkat sudah terhubung' : state?.status === 'CONNECTING' ? 'Menyiapkan QR...' : 'QR belum tersedia'}</strong><p>{connected ? 'Session akan dipulihkan otomatis setelah server restart.' : 'Klik Hubungkan WhatsApp untuk membuat QR baru.'}</p></div>}</section></div>
+  return <div className="whatsapp-grid">
+    <section className="panel connection-card">
+      <span className={`wa-icon ${connected ? 'online' : ''}`}><Icon name="message" /></span>
+      <p className="section-kicker">STATUS PERANGKAT</p>
+      <h2>{whatsappStatus[state?.status ?? ''] ?? 'Memuat status...'}</h2>
+      <p>{state?.phoneNumber ? `+${state.phoneNumber}` : 'Belum ada nomor yang terhubung'}</p>
+      <div className="connection-facts"><SystemRow label="Session persisten" text="Tersimpan terenkripsi" /><SystemRow label="Pemulihan otomatis" text="Aktif setelah restart" /></div>
+      <div className="connection-actions">
+        {!connected ? <button className="primary" disabled={!!busy || state?.status === 'CONNECTING'} onClick={connect}>{busy === 'connect' ? 'Menghubungkan...' : 'Hubungkan WhatsApp'}</button> : <button disabled={!!busy} onClick={disconnect}>{busy === 'disconnect' ? 'Menghentikan...' : 'Hentikan koneksi'}</button>}
+        {state?.phoneNumber && <button className="danger-button" disabled={!!busy} onClick={replaceAccount}>{busy === 'replace' ? 'Menghapus session...' : 'Ganti akun WhatsApp'}</button>}
+      </div>
+    </section>
+    <section className="panel qr-card">
+      <div className="panel-head"><div><h2>Hubungkan perangkat</h2><p>Buka WhatsApp Business, pilih Perangkat tertaut, lalu pindai QR.</p></div><StatusBadge value={connected ? 'Siap mengirim' : 'Belum siap'} tone={connected ? 'success' : 'neutral'} /></div>
+      {state?.qrDataUrl ? <img className="qr" src={state.qrDataUrl} alt="QR untuk menghubungkan WhatsApp" /> : <div className={`qr-placeholder ${connected ? 'complete' : ''}`}><span><Icon name={connected ? 'check' : 'qr'} /></span><strong>{connected ? 'Perangkat sudah terhubung' : state?.status === 'CONNECTING' ? 'Menyiapkan QR...' : 'QR belum tersedia'}</strong><p>{connected ? 'Session akan dipulihkan otomatis setelah server restart.' : 'Klik Hubungkan WhatsApp untuk membuat QR baru.'}</p></div>}
+      <div className="delivery-safety-panel">
+        <h3>Pengaturan keselamatan kirim</h3>
+        <p>{!safety?.enabled ? 'Belum diaktifkan pada server.' : safety.mode === 'PAUSED_RISK' ? `Dijeda karena ${safety.holdReason ?? 'risiko pengiriman'}.` : safety.mode === 'NEW' ? `Masa awal hari ke-${safety.warmupDay}.` : 'Mode standar.'}</p>
+        {safety?.enabled && <>
+          <p>Slot hari ini: {safety.reservedToday}/{safety.dailyLimit}. Jeda antar pesan: {safety.minDelaySeconds}–{safety.maxDelaySeconds} detik.</p>
+          {safety.nextAllowedAt && <p>Slot berikutnya paling cepat: {formatDate(safety.nextAllowedAt)}. Jadwal cron dapat membuatnya lebih lambat.</p>}
+          {safety.mode === 'PAUSED_RISK' && connected && <button onClick={resumeSafety}>Buka jeda setelah pemeriksaan</button>}
+        </>}
+      </div>
+    </section>
+  </div>
 }
 
 function Metric({ label, value, helper, icon, tone }: { label: string; value: number; helper: string; icon: IconName; tone?: string }) { return <article className={`metric ${tone ?? ''}`}><div><span>{label}</span><i><Icon name={icon} /></i></div><strong>{value.toLocaleString('id-ID')}</strong><small>{helper}</small></article> }

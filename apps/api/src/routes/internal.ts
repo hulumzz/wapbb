@@ -10,6 +10,7 @@ import { MessagingProviderError, type MessagingProvider } from '../providers/wha
 import { createStableMessageId } from '../utils/idempotency.js'
 import { acquireLease, releaseLease } from '../utils/lease.js'
 import { safeSecretEqual } from '../utils/secret.js'
+import { pauseDeliveryForRisk, reserveDelivery } from '../services/delivery-safety.js'
 
 export async function registerInternalRoutes(app: FastifyInstance, provider: MessagingProvider) {
   app.post('/internal/dispatch', async (request, reply) => {
@@ -19,24 +20,50 @@ export async function registerInternalRoutes(app: FastifyInstance, provider: Mes
     try {
       const [campaign] = await db.select().from(campaigns).where(eq(campaigns.status, 'RUNNING')).orderBy(asc(campaigns.createdAt)).limit(1)
       if (!campaign) return { processed: 0, message: 'Tidak ada campaign aktif' }
-      const state = await provider.getStatus()
-      if (state.status !== 'CONNECTED' || state.authPersistence === 'degraded') return reply.code(409).send({ message: 'WhatsApp belum siap mengirim', status: state.status, reason: state.reason })
       const stale = await db.execute(sql`UPDATE message_jobs SET status = 'FAILED', processing_token = NULL, processing_at = NULL, delivery_status = 'UNKNOWN', error_code = 'DELIVERY_UNKNOWN_AFTER_RESTART', error_message = 'Periksa pengiriman sebelum retry manual.', updated_at = NOW() WHERE status = 'PROCESSING' AND processing_at < NOW() - ${config.PROCESSING_TIMEOUT_MINUTES} * INTERVAL '1 minute' RETURNING id`)
       await db.execute(sql`UPDATE message_jobs SET status = 'FAILED', error_code = 'MAX_ATTEMPTS_REACHED', error_message = 'Batas percobaan tercapai.', updated_at = NOW() WHERE status = 'QUEUED' AND attempts >= max_attempts`)
+      const state = await provider.getStatus()
+      if (state.status !== 'CONNECTED' || state.authPersistence === 'degraded') {
+        if (state.status === 'NEEDS_REAUTH') {
+          await pauseDeliveryForRisk(state.reason === 'ACCOUNT_RESTRICTED' ? 'ACCOUNT_RESTRICTED' : 'SESSION_INVALID', state.phoneNumber)
+          await db.update(campaigns).set({ status: 'PAUSED', updatedAt: new Date() }).where(and(eq(campaigns.id, campaign.id), eq(campaigns.status, 'RUNNING')))
+        }
+        return reply.code(409).send({ message: 'WhatsApp belum siap mengirim', status: state.status, reason: state.reason })
+      }
+      if ((campaign.senderPhone && campaign.senderPhone !== state.phoneNumber) || (config.WA_SAFETY_ENABLED && !campaign.senderPhone)) {
+        await db.update(campaigns).set({ status: 'PAUSED', updatedAt: new Date() }).where(and(eq(campaigns.id, campaign.id), eq(campaigns.status, 'RUNNING')))
+        return reply.code(409).send({ message: 'Nomor pengirim campaign tidak sesuai atau belum tercatat. Campaign dijeda untuk pemeriksaan.' })
+      }
       let sent = 0, failed = 0, retried = 0, skipped = 0, claimed = 0
       let circuitBroken = false
+      let deferred: { deferred: boolean; reason: string; until: string | null } | null = null
       for (let index = 0; index < campaign.batchSize && Date.now() < deadline - 3000; index++) {
-        const job = await db.transaction(async (tx) => {
+        const claim = await db.transaction(async (tx) => {
           const [current] = await tx.select().from(campaigns).where(eq(campaigns.id, campaign.id)).for('update')
           if (current?.status !== 'RUNNING') return null
           const [candidate] = await tx.select().from(messageJobs).where(and(eq(messageJobs.campaignId, campaign.id), eq(messageJobs.status, 'QUEUED'), sql`${messageJobs.scheduledAt} <= NOW()`, sql`${messageJobs.attempts} < ${messageJobs.maxAttempts}`)).orderBy(asc(messageJobs.createdAt), asc(messageJobs.id)).for('update', { skipLocked: true }).limit(1)
           if (!candidate) return null
+          const [recipient] = await tx.select({ isActive: contacts.isActive, whatsappOptIn: contacts.whatsappOptIn, phoneNormalized: contacts.phoneNormalized }).from(contacts).where(eq(contacts.id, candidate.contactId)).for('share')
+          if (!recipient?.isActive || !recipient.whatsappOptIn || recipient.phoneNormalized !== candidate.recipient) {
+            await tx.update(messageJobs).set({ status: 'SKIPPED', errorCode: 'SKIP_CONTACT', errorMessage: 'Kontak tidak aktif, tidak opt-in, atau nomor berubah.', updatedAt: new Date() }).where(eq(messageJobs.id, candidate.id))
+            return { skipped: true }
+          }
+          const safety = await reserveDelivery(tx, state.phoneNumber ?? '', state.changedAt)
+          if (!safety.allowed) {
+            if (safety.until) await tx.update(messageJobs).set({ scheduledAt: safety.until, updatedAt: new Date() }).where(eq(messageJobs.id, candidate.id))
+            else await tx.update(campaigns).set({ status: 'PAUSED', updatedAt: new Date() }).where(eq(campaigns.id, campaign.id))
+            return { deferred: true, reason: safety.reason, until: safety.until?.toISOString() ?? null }
+          }
           const providerMessageId = createStableMessageId(candidate.generation ? `${candidate.id}:${candidate.generation}` : candidate.id)
           await tx.insert(messageAttempts).values({ providerMessageId, jobId: candidate.id, generation: candidate.generation }).onConflictDoNothing()
           const [updated] = await tx.update(messageJobs).set({ status: 'PROCESSING', attempts: candidate.attempts + 1, processingAt: new Date(), processingToken: token, providerMessageId, errorCode: null, errorMessage: null, updatedAt: new Date() }).where(eq(messageJobs.id, candidate.id)).returning()
-          return updated
+          return { job: updated }
         })
-        if (!job) break
+        if (!claim) break
+        if (claim.skipped) { skipped++; continue }
+        if (claim.deferred) { deferred = { deferred: true, reason: claim.reason!, until: claim.until! }; break }
+        if (!claim.job) break
+        const job = claim.job
         claimed++
         const owns = and(eq(messageJobs.id, job.id), eq(messageJobs.status, 'PROCESSING'), eq(messageJobs.processingToken, token))
         const beforeRelay = async () => {
@@ -73,6 +100,12 @@ export async function registerInternalRoutes(app: FastifyInstance, provider: Mes
             await tx.update(messageJobs).set({ status: cancelled ? 'CANCELLED' : ignored ? 'SKIPPED' : retry ? 'QUEUED' : 'FAILED', attempts: stopped ? job.attempts - 1 : job.attempts, deliveryStatus: failure.deliveryUncertain ? 'UNKNOWN' : retry || ignored ? null : 'ERROR', processingAt: null, processingToken: null, scheduledAt: retry && !stopped ? new Date(Date.now() + config.RETRY_DELAY_SECONDS * 2 ** Math.max(job.attempts - 1, 0) * 1000) : undefined, errorCode: failure.code, errorMessage: failure.message, updatedAt: new Date() }).where(owns)
           })
           if (ignored) skipped++; else if (retry) retried++; else failed++
+          if (config.WA_SAFETY_ENABLED && ['ACCOUNT_RESTRICTED', 'REACHOUT_LIMIT', 'RATE_OVERLIMIT', 'SESSION_INVALID'].includes(failure.code)) {
+            await pauseDeliveryForRisk(failure.code)
+            await db.update(campaigns).set({ status: 'PAUSED', updatedAt: new Date() }).where(and(eq(campaigns.id, campaign.id), eq(campaigns.status, 'RUNNING')))
+            circuitBroken = true
+            break
+          }
           if (stopped || (await provider.getStatus()).status !== 'CONNECTED') { circuitBroken = true; break }
         }
       }
@@ -82,7 +115,7 @@ export async function registerInternalRoutes(app: FastifyInstance, provider: Mes
         const [remaining] = await tx.select({ count: sql<number>`count(*)::int` }).from(messageJobs).where(and(eq(messageJobs.campaignId, campaign.id), sql`${messageJobs.status} IN ('QUEUED', 'PROCESSING')`))
         if (!remaining.count) await tx.update(campaigns).set({ status: 'COMPLETED', completedAt: new Date(), updatedAt: new Date() }).where(eq(campaigns.id, campaign.id))
       })
-      return { processed: sent + failed + retried + skipped, claimed, submitted: sent, sent, failed, retried, skipped, circuitBroken, recoveredAsUnknown: stale.rows.length, campaignId: campaign.id }
+      return { processed: sent + failed + retried + skipped, claimed, submitted: sent, sent, failed, retried, skipped, circuitBroken, deferred, recoveredAsUnknown: stale.rows.length, campaignId: campaign.id }
     } finally { await releaseLease('dispatch:default', token).catch(() => undefined) }
   })
 }

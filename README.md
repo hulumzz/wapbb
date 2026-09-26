@@ -57,9 +57,9 @@ Login menggunakan nilai `ADMIN_USERNAME` dan `ADMIN_PASSWORD` dari environment.
 
 ### Impor kontak
 
-Menu Kontak menerima file `.csv` dan `.xlsx` sampai total 1.000 baris atau 5 MB. Baris pertama harus memuat kolom `Nama Lengkap` dan `Nomor WhatsApp`; kolom `Opt In` opsional. Bila nilai opt-in kosong atau kolomnya tidak tersedia, kontak disimpan sebagai opt-in. Pastikan file hanya memuat penerima yang memang sudah memberikan persetujuan. Format header umum seperti `nama`, `phone`, dan `no whatsapp` juga dikenali.
+Menu Kontak menerima file `.csv` dan `.xlsx` sampai total 1.000 baris atau 5 MB. CSV harus memakai header di baris pertama; pada setiap sheet XLSX, header dicari di awal sheet sehingga baris kosong atau judul sebelum header tidak membuat sheet terlewat. Kolom wajib adalah `Nama Lengkap` dan `Nomor WhatsApp`; kolom `Opt In` opsional. Bila nilai opt-in kosong atau kolomnya tidak tersedia, kontak disimpan sebagai opt-in. Pastikan file hanya memuat penerima yang memang sudah memberikan persetujuan. Format header umum seperti `nama`, `phone`, `no whatsapp`, dan `no wa` juga dikenali.
 
-File dibaca dan dipreview di browser, kemudian server tetap melakukan validasi dan normalisasi nomor Indonesia. Baris tanpa nama, tanpa nomor, atau dengan nomor di luar 10-14 digit dilewati. Untuk XLSX, seluruh sheet yang memiliki kedua header wajib digabung; sheet petunjuk atau sheet lain tanpa header kontak diabaikan. Nomor duplikat di file maupun database tidak ditambahkan ulang.
+File dibaca dan dipreview di browser, kemudian server tetap melakukan validasi dan normalisasi nomor Indonesia. Baris tanpa nama, tanpa nomor, atau dengan nomor di luar 10-14 digit dilewati. Untuk XLSX, seluruh sheet yang memiliki kedua header wajib digabung; pratinjau menampilkan jumlah baris per sheet serta sheet yang diabaikan beserta alasannya. Periksa daftar ini sebelum menekan Impor, terutama jika ada sheet yang baru diisi. Setelah file Excel disimpan ulang, memilih file yang sama akan membaca isinya lagi. Nomor duplikat di file maupun database tidak ditambahkan ulang.
 
 ## Endpoint utama
 
@@ -112,6 +112,12 @@ Status queue `SENT` dipertahankan untuk kompatibilitas rollback `main`, tetapi U
 
 Default batch saat ini adalah 10, tetapi dapat diubah per campaign. Batch digunakan untuk kontrol operasional dan resource, bukan sebagai jaminan untuk menghindari sistem anti-spam WhatsApp.
 
+### Keselamatan pengiriman (pilot)
+
+Migration `0006_slow_flatman` menambah state `delivery_safety`; `0007_chubby_havok` menambah nomor pengirim pada campaign baru. Campaign historis tidak dibackfill karena nomor yang dulu dipakai tidak dapat dibuktikan dari data saat ini. `WA_SAFETY_ENABLED=false` adalah default sampai operator menyelesaikan pilot. Saat diaktifkan, satu nomor mendapat quota menit/jam/hari, warm-up 7 hari (10/15/25/40/60/90/120 slot per hari), jeda acak antar job, dan cooldown setelah reconnect. State berada di PostgreSQL sehingga tidak reset saat Render restart. Slot dihitung saat job di-claim; kegagalan persiapan dapat menghabiskan slot meski pesan belum direlay. Job yang tertunda tetap `QUEUED` tanpa menambah `attempts`; status dapat dilihat pada `/api/whatsapp/safety` dan halaman WhatsApp.
+
+Hanya satu campaign dapat berstatus `RUNNING`. Nomor pengirim dicatat saat start; resume/retry lintas nomor ditolak. Campaign historis tanpa nomor pengirim akan dijeda saat safety aktif dan perlu dibuat ulang setelah ditinjau. Pembatasan akun yang terdeteksi menjeda campaign dan memerlukan pemeriksaan admin sebelum `POST /api/whatsapp/safety/resume`, lalu operator melanjutkan campaign. Mengganti akun juga ditolak bila masih ada campaign dijeda. Dengan cron setiap 10 menit dan tanpa sleep di request, pada praktiknya hanya sekitar satu slot baru diproses setiap panggilan cron; sesuaikan jadwal cron setelah mengukur cold start dan kebutuhan operasional. Batas ini bukan jaminan akun bebas pembatasan; penerima harus memberi persetujuan dan opt-out tetap wajib dihormati. Rencana dan pekerjaan lanjutan ada di `docs/whatsapp-delivery-safety-plan.md`.
+
 Campaign default text-only; banner opsional memakai snapshot `DEFAULT_BANNER_URL` saat draft dibuat. Bytes hanya di memory sementara, tidak di database/filesystem; caption memakai pesan final. Link preview dan thumbnail memakai DNS tervalidasi/pinned (termasuk redirect), batas ukuran/waktu, dan high-quality media Baileys. Kegagalan preview tidak membatalkan pengiriman teks.
 
 ### Tombol tindakan WhatsApp
@@ -122,7 +128,7 @@ Kill switch default tetap `false`. Setelah pilot perangkat berhasil, aktifkan en
 
 Fitur memakai native-flow protokol WhatsApp Web melalui Baileys. Status receipt membedakan pesan yang baru diserahkan, diterima server, terkirim ke perangkat, dan dibaca. Receipt perangkat tidak menjamin setiap versi aplikasi merender tombol dengan tampilan identik, sehingga pilot lintas Android/iOS/Web tetap diperlukan.
 
-Workflow GitHub telah dihapus. Gunakan cron-job.org: POST `/internal/dispatch`, bearer `INTERNAL_DISPATCH_SECRET`, header JSON, body `{}`, setiap10menit, timeout30detik. Warm-up GET `/health` dua menit sebelumnya opsional; cold start Render tetap dapat melampaui timeout.
+Workflow GitHub telah dihapus dari branch produksi ini. File workflow lama masih ada di default branch `main`, tetapi workflow **Dispatch message queue** dan **CI** telah dinonaktifkan secara manual pada repository GitHub. Pengaturan ini terpisah dari commit; jangan aktifkan kembali dispatcher GitHub selama cron eksternal dipakai, agar tidak ada dua scheduler. Gunakan cron-job.org: POST `/internal/dispatch`, bearer `INTERNAL_DISPATCH_SECRET`, header JSON, body `{}`, setiap 10 menit, timeout 30 detik. Warm-up GET `/health` dua menit sebelumnya opsional; cold start Render tetap dapat melampaui timeout.
 
 ## Deploy ke Render
 

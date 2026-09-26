@@ -12,12 +12,13 @@ let postgres: EmbeddedPostgres, app: FastifyInstance
 let database: typeof import('./client.js')
 let sends = 0
 let accountReplacements = 0
+let providerPhone = '628123456789'
 let onSend: ((input: SendTextInput) => Promise<void>) | null = null
 const operatorKey = 'integration-operator-test-key-00000000', adminKey = 'integration-admin-test-key-00000000000'
 const headers = { authorization: `Bearer ${operatorKey}` }
 const provider = {
   connect: async () => {}, disconnect: async () => {}, replaceAccount: async () => { accountReplacements++ },
-  getStatus: async () => ({ status: 'CONNECTED' as const, phoneNumber: '628123456789', qrDataUrl: 'data:image/png;base64,test' }),
+  getStatus: async () => ({ status: 'CONNECTED' as const, phoneNumber: providerPhone, qrDataUrl: 'data:image/png;base64,test' }),
   sendText: async (input: SendTextInput) => { await onSend?.(input); await input.beforeRelay?.(); sends++; return { providerMessageId: 'fake' } },
   sendImage: async () => ({ providerMessageId: 'fake' }),
 }
@@ -39,14 +40,20 @@ before(async () => {
   assert.equal((await fetch(`${address}/health`)).status, 200)
 })
 after(async () => { await app?.close(); await database?.pool.end(); await postgres?.stop().catch((error: NodeJS.ErrnoException) => { if (error.code !== 'EBUSY') throw error }) })
-beforeEach(async () => { sends = 0; accountReplacements = 0; onSend = null; await database.pool.query('TRUNCATE contacts, campaigns, message_templates, messaging_leases, messaging_audit CASCADE') })
-async function contact() {
-  const response = await app.inject({ method: 'POST', url: '/integration/v1/contacts', headers, payload: { fullName: 'Perwakilan Rumah', phone: '081234567890', whatsappOptIn: true } })
+beforeEach(async () => {
+  sends = 0; accountReplacements = 0; onSend = null; providerPhone = '628123456789'
+  await database.pool.query('TRUNCATE contacts, campaigns, message_templates, messaging_leases, messaging_audit, delivery_safety CASCADE')
+  await database.pool.query("INSERT INTO whatsapp_accounts (id, phone_number, status) VALUES ('default', '628123456789', 'CONNECTED') ON CONFLICT (id) DO UPDATE SET phone_number='628123456789', status='CONNECTED'")
+})
+async function contact(phone = '081234567890') {
+  const response = await app.inject({ method: 'POST', url: '/integration/v1/contacts', headers, payload: { fullName: 'Perwakilan Rumah', phone, whatsappOptIn: true } })
   assert.equal(response.statusCode, 201); return response.json().id as string
 }
-async function draft() {
-  const id = await contact(), key = randomUUID()
-  const payload = { name: 'Informasi Umum', content: 'Halo {{nama}}, informasi desa.', contactIds: [id], batchSize: 10 }
+async function draft(count = 1, offset = 0) {
+  const ids = []
+  for (let index = 0; index < count; index++) ids.push(await contact(`0812345678${String(90 + offset + index)}`))
+  const id = ids[0], key = randomUUID()
+  const payload = { name: 'Informasi Umum', content: 'Halo {{nama}}, informasi desa.', contactIds: ids, batchSize: 10 }
   const preview = await app.inject({ method: 'POST', url: '/integration/v1/campaigns/preview', headers, payload })
   assert.equal(preview.statusCode, 200)
   const create = await app.inject({ method: 'POST', url: '/integration/v1/campaigns', headers: { ...headers, 'idempotency-key': key }, payload: { ...payload, previewToken: preview.json().previewToken } })
@@ -54,6 +61,98 @@ async function draft() {
   return { id: create.json().id as string, contactId: id, key, payload, previewToken: preview.json().previewToken }
 }
 const dispatch = () => app.inject({ method: 'POST', url: '/internal/dispatch', headers: { authorization: 'Bearer isolated-dispatch-test-secret' } })
+
+test('hanya satu campaign dapat berjalan, termasuk start yang bersamaan', async () => {
+  const first = await draft(), second = await draft(2, 2)
+  const [one, two] = await Promise.all([first, second].map((item) => app.inject({ method: 'POST', url: `/integration/v1/campaigns/${item.id}/start`, headers })))
+  assert.deepEqual([one.statusCode, two.statusCode].sort(), [200, 409])
+  assert.equal((await database.pool.query("SELECT count(*)::int AS total FROM campaigns WHERE status='RUNNING'")).rows[0].total, 1)
+})
+
+test('campaign lama tidak dikirim atau diulang dari nomor WhatsApp pengganti', async () => {
+  const item = await draft()
+  assert.equal((await app.inject({ method: 'POST', url: `/integration/v1/campaigns/${item.id}/start`, headers })).statusCode, 200)
+  assert.equal((await database.pool.query('SELECT sender_phone FROM campaigns WHERE id=$1', [item.id])).rows[0].sender_phone, providerPhone)
+  providerPhone = '628999999999'
+  await database.pool.query("UPDATE whatsapp_accounts SET phone_number=$1 WHERE id='default'", [providerPhone])
+  const result = await dispatch()
+  assert.equal(result.statusCode, 409)
+  assert.equal(sends, 0)
+  assert.equal((await database.pool.query('SELECT status FROM campaigns WHERE id=$1', [item.id])).rows[0].status, 'PAUSED')
+  assert.equal((await app.inject({ method: 'POST', url: `/integration/v1/campaigns/${item.id}/resume`, headers })).statusCode, 409)
+  await database.pool.query("UPDATE campaigns SET status='COMPLETED' WHERE id=$1", [item.id])
+  await database.pool.query("UPDATE message_jobs SET status='FAILED', delivery_status='UNKNOWN' WHERE campaign_id=$1", [item.id])
+  const [job] = (await database.pool.query('SELECT id FROM message_jobs WHERE campaign_id=$1', [item.id])).rows
+  const retry = await app.inject({ method: 'POST', url: `/integration/v1/messages/${job.id}/retry`, headers })
+  assert.equal(retry.statusCode, 409)
+  assert.match(retry.json().message, /Nomor pengirim/)
+})
+
+test('campaign historis tanpa nomor pengirim dijeda ketika safety diaktifkan', async () => {
+  const { config } = await import('../config.js')
+  config.WA_SAFETY_ENABLED = true
+  try {
+    const item = await draft()
+    await app.inject({ method: 'POST', url: `/integration/v1/campaigns/${item.id}/start`, headers })
+    await database.pool.query('UPDATE campaigns SET sender_phone=NULL WHERE id=$1', [item.id])
+    const result = await dispatch()
+    assert.equal(result.statusCode, 409)
+    assert.equal(sends, 0)
+    assert.equal((await database.pool.query('SELECT status FROM campaigns WHERE id=$1', [item.id])).rows[0].status, 'PAUSED')
+    assert.equal((await app.inject({ method: 'POST', url: `/integration/v1/campaigns/${item.id}/resume`, headers })).statusCode, 409)
+  } finally { config.WA_SAFETY_ENABLED = false }
+})
+
+test('safety governor menunda job kedua tanpa menghabiskan percobaan dan bertahan di database', async () => {
+  const { config } = await import('../config.js')
+  config.WA_SAFETY_ENABLED = true
+  try {
+    const item = await draft(2)
+    await app.inject({ method: 'POST', url: `/integration/v1/campaigns/${item.id}/start`, headers })
+    const result = await dispatch()
+    assert.equal(result.statusCode, 200, result.body)
+    assert.equal(result.json().sent, 1)
+    assert.equal(result.json().deferred.reason, 'PACING_OR_QUOTA')
+    assert.equal(sends, 1)
+    const jobs = (await database.pool.query('SELECT status, attempts, scheduled_at FROM message_jobs ORDER BY created_at, id')).rows
+    assert.equal(jobs.filter((job) => job.status === 'QUEUED' && job.attempts === 0 && job.scheduled_at > new Date()).length, 1)
+    const safety = await app.inject({ url: '/integration/v1/whatsapp/safety', headers })
+    assert.equal(safety.json().reservedToday, 1)
+    assert.equal((await dispatch()).json().sent, 0)
+  } finally { config.WA_SAFETY_ENABLED = false }
+})
+
+test('kontak yang opt-out sebelum dispatch tidak menghabiskan slot keselamatan', async () => {
+  const { config } = await import('../config.js')
+  config.WA_SAFETY_ENABLED = true
+  try {
+    const item = await draft(2)
+    await database.pool.query('UPDATE contacts SET whatsapp_opt_in=false WHERE id=$1', [item.contactId])
+    await database.pool.query("UPDATE message_jobs SET created_at=NOW() - INTERVAL '1 hour' WHERE contact_id=$1", [item.contactId])
+    await app.inject({ method: 'POST', url: `/integration/v1/campaigns/${item.id}/start`, headers })
+    const result = await dispatch()
+    assert.equal(result.json().skipped, 1)
+    assert.equal(result.json().sent, 1)
+    assert.equal((await app.inject({ url: '/integration/v1/whatsapp/safety', headers })).json().reservedToday, 1)
+    assert.equal((await database.pool.query("SELECT attempts FROM message_jobs WHERE status='SKIPPED'")).rows[0].attempts, 0)
+  } finally { config.WA_SAFETY_ENABLED = false }
+})
+
+test('sinyal pembatasan menjeda campaign dan butuh pemulihan admin', async () => {
+  const { config } = await import('../config.js')
+  config.WA_SAFETY_ENABLED = true
+  try {
+    const item = await draft(2)
+    await app.inject({ method: 'POST', url: `/integration/v1/campaigns/${item.id}/start`, headers })
+    onSend = async () => { throw new MessagingProviderError('Pembatasan', 'RATE_OVERLIMIT', false, true) }
+    await dispatch()
+    assert.equal((await database.pool.query('SELECT status FROM campaigns WHERE id=$1', [item.id])).rows[0].status, 'PAUSED')
+    assert.equal((await app.inject({ url: '/integration/v1/whatsapp/safety', headers })).json().mode, 'PAUSED_RISK')
+    assert.equal((await app.inject({ method: 'POST', url: `/integration/v1/campaigns/${item.id}/resume`, headers })).statusCode, 409)
+    assert.equal((await app.inject({ method: 'POST', url: '/integration/v1/whatsapp/safety/resume', headers })).statusCode, 403)
+    assert.equal((await app.inject({ method: 'POST', url: '/integration/v1/whatsapp/safety/resume', headers: { authorization: `Bearer ${adminKey}` } })).statusCode, 200)
+  } finally { config.WA_SAFETY_ENABLED = false }
+})
 
 test('scopes, JWT separation, QR redaction and pagination', async () => {
   assert.equal((await app.inject('/integration/v1/contacts')).statusCode, 401)
@@ -77,6 +176,14 @@ test('account replacement is blocked while a campaign is running', async () => {
   const response = await app.inject({ method: 'POST', url: '/integration/v1/whatsapp/replace-account', headers: { authorization: `Bearer ${adminKey}` } })
   assert.equal(response.statusCode, 409)
   assert.match(response.json().message, /campaign yang sedang berjalan/)
+  assert.equal(accountReplacements, 0)
+})
+test('account replacement is blocked while a campaign is paused', async () => {
+  const item = await draft()
+  await database.pool.query("UPDATE campaigns SET status='PAUSED' WHERE id=$1", [item.id])
+  const response = await app.inject({ method: 'POST', url: '/integration/v1/whatsapp/replace-account', headers: { authorization: `Bearer ${adminKey}` } })
+  assert.equal(response.statusCode, 409)
+  assert.match(response.json().message, /campaign dijeda/)
   assert.equal(accountReplacements, 0)
 })
 test('direct content snapshot and idempotent replay after preview expires', async () => {

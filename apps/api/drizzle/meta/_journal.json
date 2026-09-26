@@ -43,6 +43,20 @@
       "when": 1789626351952,
       "tag": "0005_magenta_living_lightning",
       "breakpoints": true
+    },
+    {
+      "idx": 6,
+      "version": "7",
+      "when": 1790406691847,
+      "tag": "0006_slow_flatman",
+      "breakpoints": true
+    },
+    {
+      "idx": 7,
+      "version": "7",
+      "when": 1790408829940,
+      "tag": "0007_chubby_havok",
+      "breakpoints": true
     }
   ]
 }

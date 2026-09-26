@@ -187,20 +187,21 @@ export class BaileysProvider implements MessagingProvider {
       const needsFreshSession = statusCode === DisconnectReason.loggedOut
         || statusCode === DisconnectReason.badSession
         || statusCode === DisconnectReason.multideviceMismatch
+      const restricted = statusCode === DisconnectReason.forbidden
       const replaced = statusCode === DisconnectReason.connectionReplaced
-      this.reason = needsFreshSession ? 'SESSION_INVALID' : replaced ? 'CONNECTION_REPLACED' : 'CONNECTION_CLOSED'
+      this.reason = restricted ? 'ACCOUNT_RESTRICTED' : needsFreshSession ? 'SESSION_INVALID' : replaced ? 'CONNECTION_REPLACED' : 'CONNECTION_CLOSED'
       this.changedAt = new Date().toISOString()
       this.authCleanup = (needsFreshSession ? clearAuth() : this.flushAuth?.() ?? Promise.resolve()).catch(() => { this.authPersistence = 'degraded' })
       this.socket = null
       this.state = {
-        status: needsFreshSession ? 'NEEDS_REAUTH' : 'DISCONNECTED',
+        status: needsFreshSession || restricted ? 'NEEDS_REAUTH' : 'DISCONNECTED',
         phoneNumber: this.state.phoneNumber,
         qrDataUrl: null,
       }
       await this.authCleanup
       await this.persistStatus(this.state.status)
 
-      if (!needsFreshSession && !this.manualDisconnect) this.scheduleReconnect()
+      if (!needsFreshSession && !restricted && !this.manualDisconnect) this.scheduleReconnect()
     }
   }
 
@@ -412,8 +413,17 @@ export class BaileysProvider implements MessagingProvider {
     if (statusCode === 400 || statusCode === 404) {
       return new MessagingProviderError('Nomor WhatsApp ditolak provider', 'INVALID_RECIPIENT', false)
     }
-    if (statusCode === DisconnectReason.loggedOut || statusCode === DisconnectReason.forbidden) {
-      return new MessagingProviderError('Session WhatsApp tidak lagi valid', 'PROVIDER_DISCONNECTED', false, true)
+    if (statusCode === DisconnectReason.forbidden) {
+      return new MessagingProviderError('WhatsApp membatasi akun ini', 'ACCOUNT_RESTRICTED', false, true)
+    }
+    if (statusCode === 463) {
+      return new MessagingProviderError('WhatsApp membatasi jangkauan akun ini', 'REACHOUT_LIMIT', false, true)
+    }
+    if (statusCode === 429) {
+      return new MessagingProviderError('WhatsApp membatasi laju pengiriman', 'RATE_OVERLIMIT', false, true)
+    }
+    if (statusCode === DisconnectReason.loggedOut) {
+      return new MessagingProviderError('Session WhatsApp tidak lagi valid', 'SESSION_INVALID', false, true)
     }
     if (statusCode === DisconnectReason.connectionClosed
       || statusCode === DisconnectReason.connectionLost

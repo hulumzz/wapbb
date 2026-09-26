@@ -30,6 +30,7 @@ export const campaigns = pgTable('campaigns', {
   contentSnapshot: text('content_snapshot'),
   bannerUrl: text('banner_url'),
   status: text('status').notNull().default('DRAFT'),
+  senderPhone: text('sender_phone'),
   batchSize: integer('batch_size').notNull().default(10),
   useBanner: boolean('use_banner').notNull().default(false),
   useInteractiveCta: boolean('use_interactive_cta').notNull().default(false),
@@ -119,6 +120,27 @@ export const messagingLeases = pgTable('messaging_leases', {
   owner: text('owner').notNull(),
   expiresAt: timestamp('expires_at', { withTimezone: true }).notNull(),
 })
+
+export const deliverySafety = pgTable('delivery_safety', {
+  accountId: text('account_id').primaryKey(),
+  phoneNumber: text('phone_number').notNull(),
+  activatedAt: timestamp('activated_at', { withTimezone: true }).notNull(),
+  lastOutboundAt: timestamp('last_outbound_at', { withTimezone: true }),
+  nextAllowedAt: timestamp('next_allowed_at', { withTimezone: true }),
+  lastConnectedAt: timestamp('last_connected_at', { withTimezone: true }),
+  cooldownUntil: timestamp('cooldown_until', { withTimezone: true }),
+  mode: text('mode').notNull().default('NEW'),
+  holdReason: text('hold_reason'),
+  minuteBucket: timestamp('minute_bucket', { withTimezone: true }),
+  minuteCount: integer('minute_count').notNull().default(0),
+  hourBucket: timestamp('hour_bucket', { withTimezone: true }),
+  hourCount: integer('hour_count').notNull().default(0),
+  dayBucket: timestamp('day_bucket', { withTimezone: true }),
+  dayCount: integer('day_count').notNull().default(0),
+  updatedAt: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
+}, (table) => [
+  check('delivery_safety_mode_check', sql`${table.mode} IN ('NEW', 'STANDARD', 'PAUSED_RISK', 'MANUAL_HOLD')`),
+])
 
 export const messageAttempts = pgTable('message_attempts', {
   providerMessageId: text('provider_message_id').primaryKey(),

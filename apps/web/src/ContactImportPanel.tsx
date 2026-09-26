@@ -1,6 +1,6 @@
-import { ChangeEvent, useState } from 'react'
+import { ChangeEvent, useRef, useState } from 'react'
 import { api } from './api'
-import { ContactImportRow, parseContactFile } from './contact-import'
+import { ContactImportParseResult, ContactImportRow, parseContactFile } from './contact-import'
 
 type ImportIssue = { sheetName?: string; rowNumber: number; kind: 'INVALID' | 'DUPLICATE'; message: string }
 type ImportResult = { received: number; imported: number; duplicates: number; invalid: number; skipped: number; issues: ImportIssue[] }
@@ -9,21 +9,29 @@ export function ContactImportPanel({ onImported, notify }: { onImported: () => P
   const [rows, setRows] = useState<ContactImportRow[]>([])
   const [skipped, setSkipped] = useState(0)
   const [sheetNames, setSheetNames] = useState<string[]>([])
+  const [sheetSummaries, setSheetSummaries] = useState<ContactImportParseResult['sheetSummaries']>([])
+  const [ignoredSheets, setIgnoredSheets] = useState<ContactImportParseResult['ignoredSheets']>([])
   const [fileName, setFileName] = useState('')
   const [error, setError] = useState('')
   const [reading, setReading] = useState(false)
   const [importing, setImporting] = useState(false)
   const [result, setResult] = useState<ImportResult | null>(null)
   const [inputKey, setInputKey] = useState(0)
+  const selectionId = useRef(0)
 
   async function chooseFile(event: ChangeEvent<HTMLInputElement>) {
-    const file = event.target.files?.[0]
+    const file = event.currentTarget.files?.[0]
     if (!file) return
+    event.currentTarget.value = ''
+    const currentSelection = ++selectionId.current
+    setReading(false)
     setError('')
     setResult(null)
     setRows([])
     setSkipped(0)
     setSheetNames([])
+    setSheetSummaries([])
+    setIgnoredSheets([])
     setFileName(file.name)
     if (file.size > 5 * 1024 * 1024) {
       setError('Ukuran file maksimal 5 MB.')
@@ -34,14 +42,18 @@ export function ContactImportPanel({ onImported, notify }: { onImported: () => P
     setReading(true)
     try {
       const parsed = await parseContactFile(file)
+      if (currentSelection !== selectionId.current) return
       setRows(parsed.rows)
       setSkipped(parsed.skipped)
       setSheetNames(parsed.sheetNames)
+      setSheetSummaries(parsed.sheetSummaries)
+      setIgnoredSheets(parsed.ignoredSheets)
     } catch (caught) {
+      if (currentSelection !== selectionId.current) return
       setError(caught instanceof Error ? caught.message : 'File tidak dapat dibaca.')
       setInputKey((value) => value + 1)
     } finally {
-      setReading(false)
+      if (currentSelection === selectionId.current) setReading(false)
     }
   }
 
@@ -66,12 +78,16 @@ export function ContactImportPanel({ onImported, notify }: { onImported: () => P
   }
 
   function reset() {
+    selectionId.current += 1
     setRows([])
     setSkipped(0)
     setSheetNames([])
+    setSheetSummaries([])
+    setIgnoredSheets([])
     setFileName('')
     setError('')
     setResult(null)
+    setReading(false)
     setInputKey((value) => value + 1)
   }
 
@@ -89,6 +105,11 @@ export function ContactImportPanel({ onImported, notify }: { onImported: () => P
     {error && <div className="inline-alert danger">{error}</div>}
     {!!rows.length && <>
       <div className="import-summary"><strong>{rows.length}</strong><span>baris siap diperiksa server{skipped ? ` · ${skipped} baris dilewati` : ''}{sheetNames.length > 1 ? ` · ${sheetNames.length} sheet kontak` : ''}</span></div>
+      {!!sheetSummaries.length && <div className="import-sheet-report">
+        <strong>Sheet yang terbaca</strong>
+        <ul>{sheetSummaries.map((sheet) => <li key={sheet.sheetName}>{sheet.sheetName}: {sheet.ready} baris siap{sheet.skipped ? `, ${sheet.skipped} dilewati` : ''} (header baris {sheet.headerRow})</li>)}</ul>
+        {!!ignoredSheets.length && <><strong>Sheet yang tidak diimpor — periksa sebelum melanjutkan</strong><ul>{ignoredSheets.map((sheet) => <li key={sheet.sheetName}>{sheet.sheetName}: {sheet.reason}</li>)}</ul></>}
+      </div>}
       <div className="import-preview table-wrap"><table><thead><tr>{!!sheetNames.length && <th>Sheet</th>}<th>Baris</th><th>Nama</th><th>Nomor</th><th>Opt-in</th></tr></thead><tbody>{rows.slice(0, 5).map((row) => <tr key={`${row.sheetName ?? 'csv'}-${row.rowNumber}`}>
         {!!sheetNames.length && <td>{row.sheetName}</td>}<td>{row.rowNumber}</td><td>{row.fullName}</td><td>{row.phone}</td><td>{row.whatsappOptIn ? 'Ya' : 'Tidak'}</td>
       </tr>)}</tbody></table>{rows.length > 5 && <p className="preview-more">+ {rows.length - 5} baris lainnya</p>}</div>

@@ -35,6 +35,13 @@ const envSchema = z.object({
   DEFAULT_BATCH_SIZE: z.coerce.number().int().min(1).max(50).default(10),
   PROCESSING_TIMEOUT_MINUTES: z.coerce.number().int().min(5).max(1440).default(15),
   RETRY_DELAY_SECONDS: z.coerce.number().int().min(5).max(3600).default(60),
+  WA_SAFETY_ENABLED: z.enum(['true', 'false']).default('false').transform((value) => value === 'true'),
+  WA_SAFETY_MIN_DELAY_SECONDS: z.coerce.number().int().min(10).max(3600).default(45),
+  WA_SAFETY_MAX_DELAY_SECONDS: z.coerce.number().int().min(10).max(7200).default(120),
+  WA_SAFETY_MAX_PER_MINUTE: z.coerce.number().int().min(1).max(100).default(1),
+  WA_SAFETY_MAX_PER_HOUR: z.coerce.number().int().min(1).max(1000).default(12),
+  WA_SAFETY_MAX_PER_DAY: z.coerce.number().int().min(1).max(10000).default(120),
+  WA_SAFETY_RECONNECT_COOLDOWN_SECONDS: z.coerce.number().int().min(0).max(3600).default(60),
   DEFAULT_BANNER_URL: z.string().url().refine(
     (value) => value.startsWith('https://'),
     'DEFAULT_BANNER_URL harus menggunakan HTTPS',
@@ -49,4 +56,7 @@ const envSchema = z.object({
 export const config = envSchema.parse(process.env)
 if (config.SID_OPERATOR_API_KEY && config.SID_OPERATOR_API_KEY === config.SID_ADMIN_API_KEY) {
   throw new Error('Key integrasi admin dan operator harus berbeda')
+}
+if (config.WA_SAFETY_MAX_DELAY_SECONDS < config.WA_SAFETY_MIN_DELAY_SECONDS) {
+  throw new Error('WA_SAFETY_MAX_DELAY_SECONDS harus >= WA_SAFETY_MIN_DELAY_SECONDS')
 }

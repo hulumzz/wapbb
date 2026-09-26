@@ -10,19 +10,24 @@ export type ContactImportParseResult = {
   rows: ContactImportRow[]
   skipped: number
   sheetNames: string[]
+  sheetSummaries: Array<{ sheetName: string; headerRow: number; ready: number; skipped: number }>
+  ignoredSheets: Array<{ sheetName: string; reason: string }>
 }
 
 type Cell = string | number | boolean | Date | typeof Date | null | undefined
 
 const NAME_HEADERS = new Set(['nama', 'nama lengkap', 'nama penerima', 'name', 'full name'])
-const PHONE_HEADERS = new Set(['nomor', 'nomor whatsapp', 'no whatsapp', 'nomor telepon', 'no telepon', 'nomor hp', 'no hp', 'telepon', 'telp', 'phone', 'telephone', 'whatsapp'])
+const PHONE_HEADERS = new Set(['nomor', 'nomor whatsapp', 'no whatsapp', 'nomor wa', 'no wa', 'nomor telepon', 'no telepon', 'nomor hp', 'no hp', 'telepon', 'telp', 'phone', 'telephone', 'whatsapp'])
 const OPT_IN_HEADERS = new Set(['opt in', 'whatsapp opt in', 'izin whatsapp', 'bersedia'])
+const MAX_HEADER_SCAN_ROWS = 1000
+const MAX_HEADER_SCAN_NONEMPTY_ROWS = 25
 
 function normalizeHeader(value: Cell) {
   return String(value ?? '')
     .replace(/^\uFEFF/, '')
     .toLowerCase()
-    .replace(/[_.\-]+/g, ' ')
+    .replace(/\([^)]*\)/g, ' ')
+    .replace(/[_.\-:*]+/g, ' ')
     .replace(/\s+/g, ' ')
     .trim()
 }
@@ -92,8 +97,8 @@ export function parseCsv(text: string): string[][] {
   return rows
 }
 
-function headerIndexes(rows: Cell[][]) {
-  const headers = (rows[0] ?? []).map(normalizeHeader)
+function headerIndexes(row: Cell[]) {
+  const headers = row.map(normalizeHeader)
   return {
     nameIndex: headers.findIndex((header) => NAME_HEADERS.has(header)),
     phoneIndex: headers.findIndex((header) => PHONE_HEADERS.has(header)),
@@ -101,9 +106,22 @@ function headerIndexes(rows: Cell[][]) {
   }
 }
 
-function mapRows(rows: Cell[][], sheetName?: string) {
+function findHeaderRow(rows: Cell[][]) {
+  let nonemptyRows = 0
+  for (let index = 0; index < Math.min(rows.length, MAX_HEADER_SCAN_ROWS); index += 1) {
+    const row = rows[index] ?? []
+    if (!row.some((cell) => cellText(cell))) continue
+    const { nameIndex, phoneIndex } = headerIndexes(row)
+    if (nameIndex >= 0 && phoneIndex >= 0) return index
+    nonemptyRows += 1
+    if (nonemptyRows >= MAX_HEADER_SCAN_NONEMPTY_ROWS) break
+  }
+  return -1
+}
+
+function mapRows(rows: Cell[][], sheetName?: string, headerRowIndex = 0) {
   if (!rows.length) throw new Error('File tidak berisi data.')
-  const { nameIndex, phoneIndex, optInIndex } = headerIndexes(rows)
+  const { nameIndex, phoneIndex, optInIndex } = headerIndexes(rows[headerRowIndex] ?? [])
 
   if (nameIndex < 0 || phoneIndex < 0) {
     throw new Error('Header wajib tidak ditemukan. Gunakan kolom "Nama Lengkap" dan "Nomor WhatsApp".')
@@ -111,7 +129,7 @@ function mapRows(rows: Cell[][], sheetName?: string) {
 
   let skipped = 0
   let sourceRows = 0
-  const result = rows.slice(1).flatMap((row, index) => {
+  const result = rows.slice(headerRowIndex + 1).flatMap((row, index) => {
     if (!row.some((cell) => cellText(cell))) return []
     sourceRows += 1
     const fullName = cellText(row[nameIndex])
@@ -123,7 +141,7 @@ function mapRows(rows: Cell[][], sheetName?: string) {
     }
     return [{
       sheetName,
-      rowNumber: index + 2,
+      rowNumber: headerRowIndex + index + 2,
       fullName,
       phone,
       whatsappOptIn: optInIndex < 0 ? true : optInValue(row[optInIndex]),
@@ -142,16 +160,20 @@ export function mapContactRows(rows: Cell[][]): ContactImportRow[] {
 }
 
 export function mapContactSheets(sheets: Array<{ sheet: string; data: Cell[][] }>): ContactImportParseResult {
-  const contactSheets = sheets.filter(({ data }) => {
-    const { nameIndex, phoneIndex } = headerIndexes(data)
-    return nameIndex >= 0 && phoneIndex >= 0
-  })
+  const inspected = sheets.map(({ sheet, data }) => ({ sheet, data, headerRowIndex: findHeaderRow(data) }))
+  const contactSheets = inspected.filter(({ headerRowIndex }) => headerRowIndex >= 0)
+  const ignoredSheets = inspected.filter(({ headerRowIndex }) => headerRowIndex < 0).map(({ sheet, data }) => ({
+    sheetName: sheet,
+    reason: data.some((row) => row.some((cell) => cellText(cell)))
+      ? 'header Nama Lengkap dan Nomor WhatsApp tidak ditemukan di awal sheet'
+      : 'sheet kosong',
+  }))
 
   if (!contactSheets.length) {
-    throw new Error('Tidak ada sheet dengan header "Nama Lengkap" dan "Nomor WhatsApp".')
+    throw new Error(`Tidak ada sheet dengan header "Nama Lengkap" dan "Nomor WhatsApp". Sheet yang diperiksa: ${sheets.map(({ sheet }) => sheet).join(', ') || 'tidak ada'}.`)
   }
 
-  const mapped = contactSheets.map(({ sheet, data }) => mapRows(data, sheet))
+  const mapped = contactSheets.map(({ sheet, data, headerRowIndex }) => ({ sheet, headerRowIndex, ...mapRows(data, sheet, headerRowIndex) }))
   const sourceRows = mapped.reduce((total, item) => total + item.sourceRows, 0)
   const rows = mapped.flatMap((item) => item.rows)
   if (sourceRows > 1000) throw new Error('Maksimal 1.000 baris untuk total seluruh sheet kontak.')
@@ -161,6 +183,8 @@ export function mapContactSheets(sheets: Array<{ sheet: string; data: Cell[][] }
     rows,
     skipped: mapped.reduce((total, item) => total + item.skipped, 0),
     sheetNames: contactSheets.map(({ sheet }) => sheet),
+    sheetSummaries: mapped.map(({ sheet, headerRowIndex, rows: sheetRows, skipped }) => ({ sheetName: sheet, headerRow: headerRowIndex + 1, ready: sheetRows.length, skipped })),
+    ignoredSheets,
   }
 }
 
@@ -171,7 +195,7 @@ export async function parseContactFile(file: File): Promise<ContactImportParseRe
     const mapped = mapRows(parsed)
     if (mapped.sourceRows > 1000) throw new Error('Maksimal 1.000 baris per file impor.')
     if (!mapped.rows.length) throw new Error('Tidak ada baris dengan nama dan nomor WhatsApp yang valid.')
-    return { rows: mapped.rows, skipped: mapped.skipped, sheetNames: [] }
+    return { rows: mapped.rows, skipped: mapped.skipped, sheetNames: [], sheetSummaries: [], ignoredSheets: [] }
   }
   if (extension === 'xlsx') {
     const { default: readExcelFile } = await import('read-excel-file/browser')
