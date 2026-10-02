@@ -1,4 +1,4 @@
-import { FormEvent, useEffect, useMemo, useState, type ReactNode } from 'react'
+import { FormEvent, useEffect, useMemo, useRef, useState, type ReactNode } from 'react'
 import { api, getAuthUser } from './api'
 import { ContactImportPanel } from './ContactImportPanel'
 
@@ -152,9 +152,8 @@ function DashboardPage({ navigate }: { navigate: (page: Page) => void }) {
 
   useEffect(() => {
     void load()
-    const timer = window.setInterval(() => void load(true), 10000)
-    return () => window.clearInterval(timer)
   }, [])
+  useVisibleInterval(() => load(true), 30_000)
 
   if (error) return <EmptyState title="Layanan belum dapat dijangkau" text={error} action={<button onClick={() => load()}>Coba lagi</button>} />
   if (!data) return <Loading />
@@ -295,7 +294,7 @@ function CampaignsPage({ notify }: { notify: Notify }) {
     if (!templateId && firstActive) setTemplateId(firstActive.id)
   }
   useEffect(() => { void load().catch(() => undefined) }, [])
-  useEffect(() => { const timer = window.setInterval(() => void api<Campaign[]>('/api/campaigns').then(setCampaigns).catch(() => undefined), 8000); return () => window.clearInterval(timer) }, [])
+  useVisibleInterval(() => api<Campaign[]>('/api/campaigns').then(setCampaigns).catch(() => undefined), 30_000)
 
   const selectedTemplate = useMemo(() => templates.find((template) => template.id === templateId), [templates, templateId])
   const visibleContacts = useMemo(() => contacts.filter((contact) => contact.fullName.toLowerCase().includes(recipientSearch.toLowerCase()) || contact.phoneNormalized.includes(recipientSearch)), [contacts, recipientSearch])
@@ -349,7 +348,8 @@ function HistoryPage({ notify }: { notify: Notify }) {
   const [search, setSearch] = useState('')
   const [loading, setLoading] = useState(true)
   const load = async (silent = false) => { if (!silent) setLoading(true); try { setItems(await api<Message[]>('/api/messages')) } catch (caught) { if (!silent) notify(caught instanceof Error ? caught.message : 'Riwayat tidak dapat dimuat') } finally { if (!silent) setLoading(false) } }
-  useEffect(() => { void load(); const timer = window.setInterval(() => void load(true), 7000); return () => window.clearInterval(timer) }, [])
+  useEffect(() => { void load() }, [])
+  useVisibleInterval(() => load(true), 30_000)
   const filtered = useMemo(() => items.filter((item) => { const matchesStatus = status === 'ALL' || item.status === status || item.deliveryStatus === status; const needle = search.trim().toLowerCase(); return matchesStatus && (!needle || item.recipient.includes(needle) || item.renderedMessage.toLowerCase().includes(needle)) }), [items, search, status])
   const counts = useMemo(() => ({ submitted: items.filter((item) => item.status === 'SENT').length, delivered: items.filter((item) => ['DELIVERED', 'READ', 'PLAYED'].includes(item.deliveryStatus ?? '')).length, failed: items.filter((item) => item.status === 'FAILED' || item.deliveryStatus === 'ERROR').length }), [items])
   async function retry(message: Message) {
@@ -370,8 +370,11 @@ function WhatsappPage({ notify }: { notify: Notify }) {
   const [state, setState] = useState<WhatsappState | null>(null)
   const [safety, setSafety] = useState<DeliverySafetyState | null>(null)
   const [busy, setBusy] = useState<'connect' | 'disconnect' | 'replace' | null>(null)
-  const load = async () => { const [status, safetyStatus] = await Promise.all([api<WhatsappState>('/api/whatsapp/status'), api<DeliverySafetyState>('/api/whatsapp/safety')]); setState(status); setSafety(safetyStatus) }
-  useEffect(() => { void load().catch(() => undefined); const timer = window.setInterval(() => void load().catch(() => undefined), 3000); return () => window.clearInterval(timer) }, [])
+  const loadStatus = async () => { setState(await api<WhatsappState>('/api/whatsapp/status')) }
+  const loadSafety = async () => { setSafety(await api<DeliverySafetyState>('/api/whatsapp/safety')) }
+  useEffect(() => { void Promise.all([loadStatus(), loadSafety()]).catch(() => undefined) }, [])
+  useVisibleInterval(() => loadStatus().catch(() => undefined), 5_000)
+  useVisibleInterval(() => loadSafety().catch(() => undefined), 60_000)
   async function connect() { setBusy('connect'); try { setState(await api('/api/whatsapp/connect', { method: 'POST' })); notify('Proses koneksi WhatsApp dimulai') } catch (caught) { notify(caught instanceof Error ? caught.message : 'WhatsApp gagal dihubungkan') } finally { setBusy(null) } }
   async function disconnect() { if (!window.confirm('Hentikan koneksi WhatsApp saat ini? Session tetap tersimpan dan dapat digunakan kembali.')) return; setBusy('disconnect'); try { setState(await api('/api/whatsapp/disconnect', { method: 'POST' })); notify('Koneksi dihentikan tanpa menghapus session') } catch (caught) { notify(caught instanceof Error ? caught.message : 'Koneksi gagal dihentikan') } finally { setBusy(null) } }
   async function replaceAccount() {
@@ -396,7 +399,7 @@ function WhatsappPage({ notify }: { notify: Notify }) {
       <p className="section-kicker">STATUS PERANGKAT</p>
       <h2>{whatsappStatus[state?.status ?? ''] ?? 'Memuat status...'}</h2>
       <p>{state?.phoneNumber ? `+${state.phoneNumber}` : 'Belum ada nomor yang terhubung'}</p>
-      <div className="connection-facts"><SystemRow label="Session persisten" text="Tersimpan terenkripsi" /><SystemRow label="Pemulihan otomatis" text="Aktif setelah restart" /></div>
+      <div className="connection-facts"><SystemRow label="Session persisten" text="Tersimpan terenkripsi" /><SystemRow label="Pemulihan otomatis" text="Saat campaign aktif" /></div>
       <div className="connection-actions">
         {!connected ? <button className="primary" disabled={!!busy || state?.status === 'CONNECTING'} onClick={connect}>{busy === 'connect' ? 'Menghubungkan...' : 'Hubungkan WhatsApp'}</button> : <button disabled={!!busy} onClick={disconnect}>{busy === 'disconnect' ? 'Menghentikan...' : 'Hentikan koneksi'}</button>}
         {state?.phoneNumber && <button className="danger-button" disabled={!!busy} onClick={replaceAccount}>{busy === 'replace' ? 'Menghapus session...' : 'Ganti akun WhatsApp'}</button>}
@@ -404,7 +407,7 @@ function WhatsappPage({ notify }: { notify: Notify }) {
     </section>
     <section className="panel qr-card">
       <div className="panel-head"><div><h2>Hubungkan perangkat</h2><p>Buka WhatsApp Business, pilih Perangkat tertaut, lalu pindai QR.</p></div><StatusBadge value={connected ? 'Siap mengirim' : 'Belum siap'} tone={connected ? 'success' : 'neutral'} /></div>
-      {state?.qrDataUrl ? <img className="qr" src={state.qrDataUrl} alt="QR untuk menghubungkan WhatsApp" /> : <div className={`qr-placeholder ${connected ? 'complete' : ''}`}><span><Icon name={connected ? 'check' : 'qr'} /></span><strong>{connected ? 'Perangkat sudah terhubung' : state?.status === 'CONNECTING' ? 'Menyiapkan QR...' : 'QR belum tersedia'}</strong><p>{connected ? 'Session akan dipulihkan otomatis setelah server restart.' : 'Klik Hubungkan WhatsApp untuk membuat QR baru.'}</p></div>}
+      {state?.qrDataUrl ? <img className="qr" src={state.qrDataUrl} alt="QR untuk menghubungkan WhatsApp" /> : <div className={`qr-placeholder ${connected ? 'complete' : ''}`}><span><Icon name={connected ? 'check' : 'qr'} /></span><strong>{connected ? 'Perangkat sudah terhubung' : state?.status === 'CONNECTING' ? 'Menyiapkan QR...' : 'QR belum tersedia'}</strong><p>{connected ? 'Session tersimpan; campaign aktif akan menyambung kembali setelah server restart.' : 'Klik Hubungkan WhatsApp untuk membuat QR baru.'}</p></div>}
       <div className="delivery-safety-panel">
         <h3>Pengaturan keselamatan kirim</h3>
         <p>{!safety?.enabled ? 'Belum diaktifkan pada server.' : safety.mode === 'PAUSED_RISK' ? `Dijeda karena ${safety.holdReason ?? 'risiko pengiriman'}.` : safety.mode === 'NEW' ? `Masa awal hari ke-${safety.warmupDay}.` : 'Mode standar.'}</p>
@@ -426,6 +429,27 @@ function EmptyState({ title, text, action }: { title: string; text: string; acti
 function formatDate(value: string | null | undefined) { return value ? new Date(value).toLocaleString('id-ID', { dateStyle: 'medium', timeStyle: 'short' }) : '-' }
 function formatTime(value: Date | null) { return value?.toLocaleTimeString('id-ID', { hour: '2-digit', minute: '2-digit' }) ?? '-' }
 function firstHttpsUrl(text: string) { return text.match(/https:\/\/[^\s<>"']+/i)?.[0]?.replace(/[.,!?;:]+$/, '') }
+
+function useVisibleInterval(callback: () => void | Promise<void>, delay: number) {
+  const callbackRef = useRef(callback)
+  useEffect(() => { callbackRef.current = callback }, [callback])
+  useEffect(() => {
+    let timer: number | undefined
+    const clear = () => { if (timer !== undefined) { window.clearInterval(timer); timer = undefined } }
+    const start = () => {
+      clear()
+      if (document.visibilityState !== 'visible') return
+      timer = window.setInterval(() => { void callbackRef.current() }, delay)
+    }
+    const onVisibilityChange = () => {
+      if (document.visibilityState === 'visible') void callbackRef.current()
+      start()
+    }
+    start()
+    document.addEventListener('visibilitychange', onVisibilityChange)
+    return () => { clear(); document.removeEventListener('visibilitychange', onVisibilityChange) }
+  }, [delay])
+}
 
 type IconName = 'grid' | 'users' | 'send' | 'file' | 'history' | 'message' | 'refresh' | 'upload' | 'check' | 'alert' | 'search' | 'edit' | 'link' | 'qr'
 function Icon({ name }: { name: IconName }) {

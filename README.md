@@ -65,7 +65,8 @@ File dibaca dan dipreview di browser, kemudian server tetap melakukan validasi d
 
 Public:
 
-- `GET /health`
+- `GET /healthz` untuk probe liveness Render/UptimeRobot, tanpa mengakses database
+- `GET /health` untuk pemeriksaan kesiapan database
 - `POST /auth/login`
 
 Admin JWT:
@@ -89,7 +90,7 @@ Session Baileys tidak disimpan sebagai folder lokal. Credentials dan Signal keys
 Flow normal setelah login pertama:
 
 ```text
-server restart / redeploy
+campaign berjalan atau operator menekan Hubungkan WhatsApp
         ↓
 load auth state dari PostgreSQL
         ↓
@@ -101,6 +102,8 @@ CONNECTED
 QR baru hanya diperlukan ketika akun benar-benar logout, perangkat dihapus, atau session sudah tidak valid.
 
 Tombol **Hentikan koneksi** hanya menutup koneksi sementara dan mempertahankan session. Gunakan **Ganti akun WhatsApp** untuk menghapus session lama dan membuat QR baru. Pergantian akun ditolak selama masih ada campaign berstatus `RUNNING`; jeda atau batalkan campaign tersebut terlebih dahulu.
+
+Untuk menghemat compute Neon, kredensial session tetap persisten tetapi socket WhatsApp tidak dibuat ulang saat startup apabila tidak ada campaign `RUNNING`. Socket dan lease database dipertahankan selama campaign berjalan. Saat hanya halaman WhatsApp yang dibuka, socket dipertahankan selama halaman tersebut tetap aktif; setelah `WA_OPERATOR_IDLE_SECONDS` (default 120 detik) tanpa status dari halaman dan tanpa campaign, socket ditutup tanpa menghapus session. Neon dapat suspend otomatis sesudah tidak ada query sekitar lima menit dan akan bangun sendiri pada query berikutnya.
 
 ## Dispatcher
 
@@ -116,7 +119,7 @@ Default batch saat ini adalah 10, tetapi dapat diubah per campaign. Batch diguna
 
 Migration `0006_slow_flatman` menambah state `delivery_safety`; `0007_chubby_havok` menambah nomor pengirim pada campaign baru. Campaign historis tidak dibackfill karena nomor yang dulu dipakai tidak dapat dibuktikan dari data saat ini. `WA_SAFETY_ENABLED=false` adalah default sampai operator menyelesaikan pilot. Saat diaktifkan, satu nomor mendapat quota menit/jam/hari, warm-up 7 hari (10/15/25/40/60/90/120 slot per hari), jeda acak antar job, dan cooldown setelah reconnect. State berada di PostgreSQL sehingga tidak reset saat Render restart. Slot dihitung saat job di-claim; kegagalan persiapan dapat menghabiskan slot meski pesan belum direlay. Job yang tertunda tetap `QUEUED` tanpa menambah `attempts`; status dapat dilihat pada `/api/whatsapp/safety` dan halaman WhatsApp.
 
-Hanya satu campaign dapat berstatus `RUNNING`. Nomor pengirim dicatat saat start; resume/retry lintas nomor ditolak. Campaign historis tanpa nomor pengirim akan dijeda saat safety aktif dan perlu dibuat ulang setelah ditinjau. Pembatasan akun yang terdeteksi menjeda campaign dan memerlukan pemeriksaan admin sebelum `POST /api/whatsapp/safety/resume`, lalu operator melanjutkan campaign. Mengganti akun juga ditolak bila masih ada campaign dijeda. Dengan cron setiap 10 menit dan tanpa sleep di request, pada praktiknya hanya sekitar satu slot baru diproses setiap panggilan cron; sesuaikan jadwal cron setelah mengukur cold start dan kebutuhan operasional. Batas ini bukan jaminan akun bebas pembatasan; penerima harus memberi persetujuan dan opt-out tetap wajib dihormati. Rencana dan pekerjaan lanjutan ada di `docs/whatsapp-delivery-safety-plan.md`.
+Hanya satu campaign dapat berstatus `RUNNING`. Nomor pengirim dicatat saat start; resume/retry lintas nomor ditolak. Campaign historis tanpa nomor pengirim akan dijeda saat safety aktif dan perlu dibuat ulang setelah ditinjau. Pembatasan akun yang terdeteksi menjeda campaign dan memerlukan pemeriksaan admin sebelum `POST /api/whatsapp/safety/resume`, lalu operator melanjutkan campaign. Mengganti akun juga ditolak bila masih ada campaign dijeda. Cron eksternal tetap berfungsi sebagai dispatcher dan pemulihan setelah restart. Untuk provider Baileys, status campaign disinkronkan pada startup dan setiap mutasi campaign; panggilan cron ketika idle berhenti di memori proses tanpa membuka koneksi Neon. Batas ini bukan jaminan akun bebas pembatasan; penerima harus memberi persetujuan dan opt-out tetap wajib dihormati. Rencana dan pekerjaan lanjutan ada di `docs/whatsapp-delivery-safety-plan.md`.
 
 Campaign default text-only; banner opsional memakai snapshot `DEFAULT_BANNER_URL` saat draft dibuat. Bytes hanya di memory sementara, tidak di database/filesystem; caption memakai pesan final. Link preview dan thumbnail memakai DNS tervalidasi/pinned (termasuk redirect), batas ukuran/waktu, dan high-quality media Baileys. Kegagalan preview tidak membatalkan pengiriman teks.
 
@@ -128,7 +131,7 @@ Kill switch default tetap `false`. Setelah pilot perangkat berhasil, aktifkan en
 
 Fitur memakai native-flow protokol WhatsApp Web melalui Baileys. Status receipt membedakan pesan yang baru diserahkan, diterima server, terkirim ke perangkat, dan dibaca. Receipt perangkat tidak menjamin setiap versi aplikasi merender tombol dengan tampilan identik, sehingga pilot lintas Android/iOS/Web tetap diperlukan.
 
-Workflow GitHub telah dihapus dari branch produksi ini. File workflow lama masih ada di default branch `main`, tetapi workflow **Dispatch message queue** dan **CI** telah dinonaktifkan secara manual pada repository GitHub. Pengaturan ini terpisah dari commit; jangan aktifkan kembali dispatcher GitHub selama cron eksternal dipakai, agar tidak ada dua scheduler. Gunakan cron-job.org: POST `/internal/dispatch`, bearer `INTERNAL_DISPATCH_SECRET`, header JSON, body `{}`, setiap 10 menit, timeout 30 detik. Warm-up GET `/health` dua menit sebelumnya opsional; cold start Render tetap dapat melampaui timeout.
+Workflow GitHub telah dihapus dari branch produksi ini. File workflow lama masih ada di default branch `main`, tetapi workflow **Dispatch message queue** dan **CI** telah dinonaktifkan secara manual pada repository GitHub. Pengaturan ini terpisah dari commit; jangan aktifkan kembali dispatcher GitHub selama cron eksternal dipakai, agar tidak ada dua scheduler. Gunakan cron-job.org: POST `/internal/dispatch`, bearer `INTERNAL_DISPATCH_SECRET`, header JSON, body `{}`, dengan timeout 30 detik. Arahkan UptimeRobot ke `GET /healthz`, bukan `/health`; endpoint liveness ini menjaga Render tanpa menjalankan query Neon. Jangan tambahkan warm-up database berkala.
 
 ## Deploy ke Render
 

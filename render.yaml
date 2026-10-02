@@ -6,7 +6,7 @@ services:
     region: singapore
     buildCommand: npm ci --include=dev && npm run build -w @wapbb/api
     startCommand: npm run db:migrate:compiled -w @wapbb/api && npm run start -w @wapbb/api
-    healthCheckPath: /health
+    healthCheckPath: /healthz
     autoDeployTrigger: commit
     envVars:
       - key: NODE_VERSION

@@ -57,4 +57,11 @@ export interface MessagingProvider {
   getStatus(): Promise<MessagingState>
   sendText(input: SendTextInput): Promise<SendResult>
   sendImage(input: SendImageInput): Promise<SendResult>
+  /** Optional lifecycle hooks for providers that keep a long-lived socket. */
+  activateCampaign?(): Promise<void>
+  deactivateCampaign?(): Promise<void>
+  hasActiveCampaign?(): boolean
+  beginDispatch?(): void
+  endDispatch?(): void
+  touchOperatorSession?(): void
 }

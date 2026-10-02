@@ -9,6 +9,7 @@ import { createCampaignRequestHash } from '../utils/campaign-idempotency.js'
 import { extractHttpsUrl } from '../utils/message-link.js'
 import { renderMessageTemplate } from '../utils/template.js'
 import { isDeliveryHeld } from '../services/delivery-safety.js'
+import type { MessagingProvider } from '../providers/whatsapp/types.js'
 
 const createCampaign = z.object({
   name: z.string().trim().min(2).max(120),
@@ -32,7 +33,7 @@ async function eligibleRecipients(input: Pick<CampaignInput, 'contactIds'>) {
   return db.select().from(contacts).where(recipientFilter)
 }
 
-export async function registerCampaignRoutes(app: FastifyInstance) {
+export async function registerCampaignRoutes(app: FastifyInstance, provider: MessagingProvider) {
   app.get('/api/campaigns/settings', async () => ({
     defaultBannerUrl: config.DEFAULT_BANNER_URL,
     interactiveCtaEnabled: config.INTERACTIVE_CTA_ENABLED,
@@ -183,9 +184,9 @@ export async function registerCampaignRoutes(app: FastifyInstance) {
     })
   })
 
-  app.post('/api/campaigns/:id/start', async (request, reply) => updateStatus(request.params, reply, 'RUNNING', ['DRAFT'], { startedAt: new Date(), completedAt: null }))
-  app.post('/api/campaigns/:id/pause', async (request, reply) => updateStatus(request.params, reply, 'PAUSED', ['RUNNING']))
-  app.post('/api/campaigns/:id/resume', async (request, reply) => updateStatus(request.params, reply, 'RUNNING', ['PAUSED'], { completedAt: null }))
+  app.post('/api/campaigns/:id/start', async (request, reply) => updateStatus(request.params, reply, provider, 'RUNNING', ['DRAFT'], { startedAt: new Date(), completedAt: null }))
+  app.post('/api/campaigns/:id/pause', async (request, reply) => updateStatus(request.params, reply, provider, 'PAUSED', ['RUNNING']))
+  app.post('/api/campaigns/:id/resume', async (request, reply) => updateStatus(request.params, reply, provider, 'RUNNING', ['PAUSED'], { completedAt: null }))
   app.post('/api/campaigns/:id/cancel', async (request, reply) => {
     const params = z.object({ id: z.string().uuid() }).parse(request.params)
     const cancelled = await db.transaction(async (tx) => {
@@ -201,6 +202,7 @@ export async function registerCampaignRoutes(app: FastifyInstance) {
       return true
     })
     if (!cancelled) return reply.code(409).send({ message: 'Campaign tidak ditemukan atau sudah final' })
+    await provider.deactivateCampaign?.()
     return { ok: true }
   })
 
@@ -260,7 +262,7 @@ function validateInteractiveCta(input: CampaignInput, templateContent: string, r
   return url
 }
 
-async function updateStatus(paramsInput: unknown, reply: FastifyReply, status: string, from: string[], extra: Record<string, unknown> = {}) {
+async function updateStatus(paramsInput: unknown, reply: FastifyReply, provider: MessagingProvider, status: string, from: string[], extra: Record<string, unknown> = {}) {
   const params = z.object({ id: z.string().uuid() }).parse(paramsInput)
   if (status === 'RUNNING' && await isDeliveryHeld()) return reply.code(409).send({ message: 'Pengiriman WhatsApp dijeda karena risiko. Tinjau status keamanan sebelum melanjutkan campaign.' })
   const result = await db.transaction(async (tx) => {
@@ -285,5 +287,7 @@ async function updateStatus(paramsInput: unknown, reply: FastifyReply, status: s
   if (result.active) return reply.code(409).send({ message: `Campaign ${result.active.name} sedang berjalan. Jeda atau selesaikan campaign tersebut terlebih dahulu.`, activeCampaignId: result.active.id })
   const updated = result.updated
   if (!updated) return reply.code(409).send({ message: `Campaign tidak dapat diubah ke ${status} dari status saat ini` })
+  if (status === 'RUNNING') await provider.activateCampaign?.()
+  else await provider.deactivateCampaign?.()
   return updated
 }

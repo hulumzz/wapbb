@@ -42,6 +42,7 @@ const envSchema = z.object({
   WA_SAFETY_MAX_PER_HOUR: z.coerce.number().int().min(1).max(1000).default(12),
   WA_SAFETY_MAX_PER_DAY: z.coerce.number().int().min(1).max(10000).default(120),
   WA_SAFETY_RECONNECT_COOLDOWN_SECONDS: z.coerce.number().int().min(0).max(3600).default(60),
+  WA_OPERATOR_IDLE_SECONDS: z.coerce.number().int().min(30).max(3600).default(120),
   DEFAULT_BANNER_URL: z.string().url().refine(
     (value) => value.startsWith('https://'),
     'DEFAULT_BANNER_URL harus menggunakan HTTPS',

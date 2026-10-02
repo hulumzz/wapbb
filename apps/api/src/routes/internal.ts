@@ -15,11 +15,19 @@ import { pauseDeliveryForRisk, reserveDelivery } from '../services/delivery-safe
 export async function registerInternalRoutes(app: FastifyInstance, provider: MessagingProvider) {
   app.post('/internal/dispatch', async (request, reply) => {
     if (!safeSecretEqual(request.headers.authorization, `Bearer ${config.INTERNAL_DISPATCH_SECRET}`)) return reply.code(401).send({ message: 'Unauthorized' })
+    // Baileys keeps this flag in process memory. It is synchronized once at startup
+    // and on every campaign mutation, so idle cron calls do not wake Neon merely to
+    // rediscover that there is no work.
+    if (provider.hasActiveCampaign && !provider.hasActiveCampaign()) return { processed: 0, message: 'Tidak ada campaign aktif' }
     const token = randomUUID(), deadline = Date.now() + 25_000
     if (!await acquireLease('dispatch:default', token)) return { processed: 0, message: 'Dispatcher sedang berjalan' }
+    let campaignStarted = false
     try {
       const [campaign] = await db.select().from(campaigns).where(eq(campaigns.status, 'RUNNING')).orderBy(asc(campaigns.createdAt)).limit(1)
       if (!campaign) return { processed: 0, message: 'Tidak ada campaign aktif' }
+      campaignStarted = true
+      await provider.activateCampaign?.()
+      provider.beginDispatch?.()
       const stale = await db.execute(sql`UPDATE message_jobs SET status = 'FAILED', processing_token = NULL, processing_at = NULL, delivery_status = 'UNKNOWN', error_code = 'DELIVERY_UNKNOWN_AFTER_RESTART', error_message = 'Periksa pengiriman sebelum retry manual.', updated_at = NOW() WHERE status = 'PROCESSING' AND processing_at < NOW() - ${config.PROCESSING_TIMEOUT_MINUTES} * INTERVAL '1 minute' RETURNING id`)
       await db.execute(sql`UPDATE message_jobs SET status = 'FAILED', error_code = 'MAX_ATTEMPTS_REACHED', error_message = 'Batas percobaan tercapai.', updated_at = NOW() WHERE status = 'QUEUED' AND attempts >= max_attempts`)
       const state = await provider.getStatus()
@@ -116,6 +124,15 @@ export async function registerInternalRoutes(app: FastifyInstance, provider: Mes
         if (!remaining.count) await tx.update(campaigns).set({ status: 'COMPLETED', completedAt: new Date(), updatedAt: new Date() }).where(eq(campaigns.id, campaign.id))
       })
       return { processed: sent + failed + retried + skipped, claimed, submitted: sent, sent, failed, retried, skipped, circuitBroken, deferred, recoveredAsUnknown: stale.rows.length, campaignId: campaign.id }
-    } finally { await releaseLease('dispatch:default', token).catch(() => undefined) }
+    } finally {
+      await releaseLease('dispatch:default', token).catch(() => undefined)
+      if (campaignStarted) {
+        try {
+          const [running] = await db.select({ id: campaigns.id }).from(campaigns).where(eq(campaigns.status, 'RUNNING')).limit(1)
+          if (!running) await provider.deactivateCampaign?.()
+        } catch { /* Keep the provider connected if campaign state cannot be checked safely. */ }
+        provider.endDispatch?.()
+      }
+    }
   })
 }

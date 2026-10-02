@@ -6,7 +6,10 @@ import type { MessagingProvider } from '../providers/whatsapp/types.js'
 import { getDeliverySafetyStatus, resumeDelivery } from '../services/delivery-safety.js'
 
 export async function registerWhatsappRoutes(app: FastifyInstance, provider: MessagingProvider) {
-  app.get('/api/whatsapp/status', async () => provider.getStatus())
+  app.get('/api/whatsapp/status', async () => {
+    provider.touchOperatorSession?.()
+    return provider.getStatus()
+  })
   app.get('/api/whatsapp/safety', async () => getDeliverySafetyStatus((await provider.getStatus()).phoneNumber))
   app.post('/api/whatsapp/safety/resume', async (_request, reply) => {
     const state = await provider.getStatus()
@@ -22,11 +25,14 @@ export async function registerWhatsappRoutes(app: FastifyInstance, provider: Mes
   })
 
   app.post('/api/whatsapp/connect', async () => {
+    provider.touchOperatorSession?.()
     await provider.connect()
     return provider.getStatus()
   })
 
-  app.post('/api/whatsapp/disconnect', async () => {
+  app.post('/api/whatsapp/disconnect', async (_request, reply) => {
+    const [running] = await db.select({ id: campaigns.id }).from(campaigns).where(eq(campaigns.status, 'RUNNING')).limit(1)
+    if (running) return reply.code(409).send({ message: 'Campaign masih berjalan. Jeda atau batalkan campaign sebelum menghentikan koneksi WhatsApp.' })
     await provider.disconnect()
     return provider.getStatus()
   })

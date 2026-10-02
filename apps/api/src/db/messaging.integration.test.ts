@@ -14,10 +14,12 @@ let sends = 0
 let accountReplacements = 0
 let providerPhone = '628123456789'
 let onSend: ((input: SendTextInput) => Promise<void>) | null = null
+let idleDispatcher = false
 const operatorKey = 'integration-operator-test-key-00000000', adminKey = 'integration-admin-test-key-00000000000'
 const headers = { authorization: `Bearer ${operatorKey}` }
 const provider = {
   connect: async () => {}, disconnect: async () => {}, replaceAccount: async () => { accountReplacements++ },
+  hasActiveCampaign: () => !idleDispatcher,
   getStatus: async () => ({ status: 'CONNECTED' as const, phoneNumber: providerPhone, qrDataUrl: 'data:image/png;base64,test' }),
   sendText: async (input: SendTextInput) => { await onSend?.(input); await input.beforeRelay?.(); sends++; return { providerMessageId: 'fake' } },
   sendImage: async () => ({ providerMessageId: 'fake' }),
@@ -38,12 +40,21 @@ before(async () => {
   app = await (await import('../app.js')).buildApp({ provider, restore: false }); await app.ready()
   const address = await app.listen({ host: '127.0.0.1', port: 0 })
   assert.equal((await fetch(`${address}/health`)).status, 200)
+  assert.equal((await fetch(`${address}/healthz`)).status, 200)
 })
 after(async () => { await app?.close(); await database?.pool.end(); await postgres?.stop().catch((error: NodeJS.ErrnoException) => { if (error.code !== 'EBUSY') throw error }) })
 beforeEach(async () => {
   sends = 0; accountReplacements = 0; onSend = null; providerPhone = '628123456789'
+  idleDispatcher = false
   await database.pool.query('TRUNCATE contacts, campaigns, message_templates, messaging_leases, messaging_audit, delivery_safety CASCADE')
   await database.pool.query("INSERT INTO whatsapp_accounts (id, phone_number, status) VALUES ('default', '628123456789', 'CONNECTED') ON CONFLICT (id) DO UPDATE SET phone_number='628123456789', status='CONNECTED'")
+})
+
+test('cron idle berhenti sebelum membuka dispatcher database', async () => {
+  idleDispatcher = true
+  const result = await dispatch()
+  assert.equal(result.statusCode, 200)
+  assert.deepEqual(result.json(), { processed: 0, message: 'Tidak ada campaign aktif' })
 })
 async function contact(phone = '081234567890') {
   const response = await app.inject({ method: 'POST', url: '/integration/v1/contacts', headers, payload: { fullName: 'Perwakilan Rumah', phone, whatsappOptIn: true } })

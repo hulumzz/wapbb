@@ -17,7 +17,7 @@ import { registerMessageRoutes } from './routes/messages.js'
 import { registerTemplateRoutes } from './routes/templates.js'
 import { registerWhatsappRoutes } from './routes/whatsapp.js'
 import { integrationListHandler, registerIntegrationRoutes } from './routes/integration.js'
-import { messagingAudit } from './db/schema.js'
+import { campaigns, messagingAudit } from './db/schema.js'
 import { safeSecretEqual } from './utils/secret.js'
 import type { MessagingProvider } from './providers/whatsapp/types.js'
 
@@ -55,10 +55,11 @@ export async function buildApp(options: { provider?: MessagingProvider; restore?
       return reply.code(503).send({ ok: false, service: 'wapbb-api', database: 'unavailable' })
     }
   })
+  app.get('/healthz', { config: { rateLimit: false } }, async () => ({ ok: true, service: 'wapbb-api' }))
 
   app.addHook('onRequest', async (request, reply) => {
     const path = request.routeOptions.url ?? (request.raw.url ?? '').split('?')[0]
-    if (request.method === 'OPTIONS' || path === '/health' || path === '/auth/login' || path === '/internal/dispatch') {
+    if (request.method === 'OPTIONS' || path === '/health' || path === '/healthz' || path === '/auth/login' || path === '/internal/dispatch') {
       return
     }
 
@@ -81,8 +82,8 @@ export async function buildApp(options: { provider?: MessagingProvider; restore?
   await registerAuthRoutes(app)
   await registerContactRoutes(app)
   await registerTemplateRoutes(app)
-  await registerCampaignRoutes(app)
-  await registerMessageRoutes(app)
+  await registerCampaignRoutes(app, whatsapp)
+  await registerMessageRoutes(app, whatsapp)
   await registerWhatsappRoutes(app, whatsapp)
   await registerDashboardRoutes(app, whatsapp)
   await registerInternalRoutes(app, whatsapp)
@@ -130,7 +131,14 @@ export async function buildApp(options: { provider?: MessagingProvider; restore?
   })
 
   app.addHook('onReady', async () => {
-    if (options.restore !== false && whatsapp instanceof BaileysProvider) whatsapp.restore().catch(() => app.log.warn('WhatsApp session belum dapat direstore'))
+    if (options.restore !== false && whatsapp instanceof BaileysProvider) {
+      try {
+        const [running] = await db.select({ id: campaigns.id }).from(campaigns).where(sql`${campaigns.status} = 'RUNNING'`).limit(1)
+        await whatsapp.restore({ reconnect: Boolean(running) })
+      } catch {
+        app.log.warn('WhatsApp session belum dapat direstore')
+      }
+    }
   })
 
   app.addHook('preClose', async () => {

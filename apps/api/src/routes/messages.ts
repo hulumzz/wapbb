@@ -6,8 +6,9 @@ import { campaigns, messageJobs, whatsappAccounts } from '../db/schema.js'
 import { canRetryCampaignJob, shouldResumeCampaign } from '../utils/campaign-retry.js'
 import { config } from '../config.js'
 import { deliverySafety } from '../db/schema.js'
+import type { MessagingProvider } from '../providers/whatsapp/types.js'
 
-export async function registerMessageRoutes(app: FastifyInstance) {
+export async function registerMessageRoutes(app: FastifyInstance, provider: MessagingProvider) {
   app.get('/api/messages', async () => db.select().from(messageJobs).orderBy(desc(messageJobs.createdAt)).limit(200))
 
   app.get('/api/messages/:id', async (request, reply) => {
@@ -80,6 +81,7 @@ export async function registerMessageRoutes(app: FastifyInstance) {
       return job ?? null
     })
     if (!updated) return reply.code(409).send({ message: 'Hanya pesan gagal atau berstatus tidak pasti yang dapat diantrekan ulang' })
+    await provider.activateCampaign?.()
     return updated
   })
 }

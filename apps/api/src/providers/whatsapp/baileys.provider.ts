@@ -2,6 +2,7 @@ import { randomUUID } from 'node:crypto'
 import makeWASocket, { DisconnectReason, generateWAMessage, prepareWAMessageMedia, type AnyMessageContent, type ConnectionState, type WAMessageUpdate, type WASocket, type WAMessageContent } from '@whiskeysockets/baileys'
 import QRCode from 'qrcode'
 import { and, eq, inArray, isNull, or, sql } from 'drizzle-orm'
+import { config } from '../../config.js'
 import { db } from '../../db/client.js'
 import { messageAttempts, messageJobs, whatsappAccounts } from '../../db/schema.js'
 import { acquireLease, releaseLease } from '../../utils/lease.js'
@@ -39,15 +40,52 @@ export class BaileysProvider implements MessagingProvider {
   private authPersistence: 'healthy' | 'degraded' = 'healthy'
   private reason: string | null = null
   private changedAt = new Date().toISOString()
+  private campaignActive = false
+  private dispatchActive = false
+  private operatorActiveUntil = 0
+  private idleDisconnectTimer: NodeJS.Timeout | null = null
 
-  async restore(): Promise<void> {
-    try { await this.ensureAccount(); if (await hasStoredAuthState(ACCOUNT_ID)) await this.connect() }
+  async restore({ reconnect = true }: { reconnect?: boolean } = {}): Promise<void> {
+    try {
+      await this.ensureAccount()
+      if (reconnect && await hasStoredAuthState(ACCOUNT_ID)) await this.activateCampaign()
+    }
     catch (error) {
       const invalid = (error as { code?: string }).code === 'AUTH_STATE_INVALID'
       this.reason = invalid ? 'AUTH_STATE_INVALID' : 'RESTORE_FAILED'
       this.state.status = invalid ? 'NEEDS_REAUTH' : 'DISCONNECTED'
       if (!invalid) this.scheduleReconnect()
     }
+  }
+
+  async activateCampaign(): Promise<void> {
+    this.campaignActive = true
+    this.clearIdleDisconnect()
+    await this.connect()
+  }
+
+  async deactivateCampaign(): Promise<void> {
+    this.campaignActive = false
+    this.scheduleIdleDisconnect()
+  }
+
+  hasActiveCampaign(): boolean {
+    return this.campaignActive
+  }
+
+  beginDispatch(): void {
+    this.dispatchActive = true
+    this.clearIdleDisconnect()
+  }
+
+  endDispatch(): void {
+    this.dispatchActive = false
+    this.scheduleIdleDisconnect()
+  }
+
+  touchOperatorSession(): void {
+    this.operatorActiveUntil = Date.now() + config.WA_OPERATOR_IDLE_SECONDS * 1000
+    this.scheduleIdleDisconnect()
   }
 
   async connect(): Promise<void> {
@@ -206,7 +244,7 @@ export class BaileysProvider implements MessagingProvider {
   }
 
   private scheduleReconnect() {
-    if (this.reconnectTimer || this.manualDisconnect) return
+    if (this.reconnectTimer || this.manualDisconnect || !this.shouldStayConnected()) return
     const delay = Math.min(RECONNECT_DELAY_MS * (2 ** this.reconnectAttempt), MAX_RECONNECT_DELAY_MS)
     this.reconnectAttempt += 1
     this.reconnectTimer = setTimeout(() => {
@@ -216,11 +254,18 @@ export class BaileysProvider implements MessagingProvider {
   }
 
   async disconnect(): Promise<void> {
+    this.campaignActive = false
+    this.dispatchActive = false
+    this.operatorActiveUntil = 0
     await this.shutdown()
     await this.persistStatus('DISCONNECTED')
   }
 
   async replaceAccount(): Promise<void> {
+    this.campaignActive = false
+    this.dispatchActive = false
+    this.operatorActiveUntil = 0
+    this.clearIdleDisconnect()
     this.manualDisconnect = true
     this.reconnectAttempt = 0
     if (this.reconnectTimer) {
@@ -280,6 +325,7 @@ export class BaileysProvider implements MessagingProvider {
     this.state = { ...this.state, status: 'DISCONNECTED', qrDataUrl: null }
     if (this.leaseTimer) clearInterval(this.leaseTimer)
     this.leaseTimer = null
+    this.clearIdleDisconnect()
     let timeout: NodeJS.Timeout | undefined
     let drained = false
     try {
@@ -291,6 +337,28 @@ export class BaileysProvider implements MessagingProvider {
 
   async getStatus(): Promise<MessagingState> {
     return { ...this.state, reason: this.reason, changedAt: this.changedAt, authPersistence: this.authPersistence }
+  }
+
+  private shouldStayConnected(): boolean {
+    return this.campaignActive || this.dispatchActive || this.operatorActiveUntil > Date.now()
+  }
+
+  private clearIdleDisconnect() {
+    if (!this.idleDisconnectTimer) return
+    clearTimeout(this.idleDisconnectTimer)
+    this.idleDisconnectTimer = null
+  }
+
+  private scheduleIdleDisconnect() {
+    this.clearIdleDisconnect()
+    if (this.campaignActive || this.dispatchActive) return
+    const delay = Math.max(0, this.operatorActiveUntil - Date.now())
+    this.idleDisconnectTimer = setTimeout(() => {
+      this.idleDisconnectTimer = null
+      if (this.shouldStayConnected()) return
+      void this.disconnect().catch(() => undefined)
+    }, delay + 25)
+    this.idleDisconnectTimer.unref()
   }
 
   async sendText(input: SendTextInput): Promise<SendResult> {
