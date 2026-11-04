@@ -5,7 +5,10 @@ import * as schema from './schema.js'
 
 const { Pool } = pg
 const databaseUrl = new URL(config.DATABASE_URL)
-if (['prefer', 'require', 'verify-ca'].includes(databaseUrl.searchParams.get('sslmode') ?? '')) {
+// Upgrade sslmode ke verify-full hanya untuk prefer/verify-ca.
+// 'require' dibiarkan apa adanya — kompatibel dengan Prisma Postgres & Neon.
+const _sslmode = databaseUrl.searchParams.get('sslmode') ?? ''
+if (['prefer', 'verify-ca'].includes(_sslmode)) {
   databaseUrl.searchParams.set('sslmode', 'verify-full')
 }
 

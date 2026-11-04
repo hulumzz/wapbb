@@ -11,8 +11,8 @@ export default defineConfig({
   out: './drizzle',
   dialect: 'postgresql',
   dbCredentials: {
-    // `generate` dan `check` hanya membaca schema dan harus tetap bisa
-    // dijalankan sebelum Neon tersedia. Runtime migrator memvalidasi URL asli.
-    url: process.env.DATABASE_URL ?? 'postgresql://placeholder:placeholder@localhost/placeholder',
+    // Prisma Postgres: gunakan DIRECT_DATABASE_URL untuk DDL (migrasi).
+    // Fallback ke DATABASE_URL untuk kompatibilitas Neon / lokal.
+    url: process.env.DIRECT_DATABASE_URL ?? process.env.DATABASE_URL ?? 'postgresql://placeholder:placeholder@localhost/placeholder',
   },
 })

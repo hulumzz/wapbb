@@ -11,3 +11,4 @@ apps/web/.vite/
 render-log.md
 dispatch-local.ps1
 konteks.md
+*.env
