@@ -47,11 +47,12 @@ export async function buildApp(options: { provider?: MessagingProvider; restore?
     timeWindow: '1 minute',
   })
 
-  app.get('/health', { config: { rateLimit: false } }, async (_request, reply) => {
+  app.get('/health', { config: { rateLimit: false } }, async (request, reply) => {
     try {
       await db.execute(sql`SELECT 1`)
       return { ok: true, service: 'wapbb-api', database: 'connected' }
-    } catch {
+    } catch (error) {
+      request.log.error(error, 'Database health check failed')
       return reply.code(503).send({ ok: false, service: 'wapbb-api', database: 'unavailable' })
     }
   })

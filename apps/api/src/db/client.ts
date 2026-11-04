@@ -19,7 +19,8 @@ export const pool = new Pool({
   idleTimeoutMillis: 20_000,
   allowExitOnIdle: true,
   application_name: 'wapbb-api',
-  statement_timeout: 5000,
+  // Catatan: jangan gunakan `statement_timeout` di sini karena Prisma Postgres pooled connection
+  // (PgBouncer transaction mode) akan menolak startup parameter session ini.
   query_timeout: 6000,
 })
 
